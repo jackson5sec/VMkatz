@@ -237,6 +237,90 @@ impl VmdkDisk {
     }
 }
 
+impl VmdkDisk {
+    /// Iterate over all physically allocated grains across all extent files.
+    ///
+    /// This bypasses normal LBA-to-grain translation and directly reads every
+    /// non-zero grain table entry from each extent. Much faster than linear
+    /// scanning for incomplete disk images with missing extents, since it only
+    /// touches data that actually exists on disk.
+    ///
+    /// Calls `callback` for each allocated grain. The callback receives the
+    /// grain's virtual byte offset and a slice of the grain data. Return `true`
+    /// from the callback to continue scanning, `false` to stop early.
+    pub fn scan_all_grains<F>(&mut self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8]) -> bool,
+    {
+        for ext_idx in 0..self.extents.len() {
+            let grain_bytes = self.extents[ext_idx].grain_size * SECTOR_SIZE;
+            let num_gtes = self.extents[ext_idx].num_gtes_per_gt;
+            let gd_len = self.extents[ext_idx].gd.len();
+            let start_sector = self.extents[ext_idx].start_sector;
+
+            for gd_idx in 0..gd_len {
+                let gt_sector = self.extents[ext_idx].gd[gd_idx];
+                if gt_sector == 0 {
+                    continue;
+                }
+
+                // Read the grain table
+                let gt_offset = gt_sector as u64 * SECTOR_SIZE;
+                let gt_size = num_gtes as usize * 4;
+                let mut gt_buf = vec![0u8; gt_size];
+                let ok = self.extents[ext_idx]
+                    .file
+                    .seek(SeekFrom::Start(gt_offset))
+                    .is_ok()
+                    && self.extents[ext_idx]
+                        .file
+                        .read_exact(&mut gt_buf)
+                        .is_ok();
+                if !ok {
+                    continue;
+                }
+
+                for gte_idx in 0..num_gtes as usize {
+                    let grain_sector = u32::from_le_bytes(
+                        gt_buf[gte_idx * 4..(gte_idx + 1) * 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    if grain_sector == 0 {
+                        continue;
+                    }
+
+                    let data_offset = grain_sector as u64 * SECTOR_SIZE;
+                    let mut grain_data = vec![0u8; grain_bytes as usize];
+                    let read_ok = self.extents[ext_idx]
+                        .file
+                        .seek(SeekFrom::Start(data_offset))
+                        .is_ok()
+                        && self.extents[ext_idx]
+                            .file
+                            .read_exact(&mut grain_data)
+                            .is_ok();
+                    if !read_ok {
+                        // Grain beyond file (truncated extent), skip
+                        continue;
+                    }
+
+                    // Virtual byte offset = (start_sector + local_grain_index * grain_size) * SECTOR_SIZE
+                    let local_grain = gd_idx as u64 * num_gtes as u64 + gte_idx as u64;
+                    let virtual_byte =
+                        (start_sector + local_grain * self.extents[ext_idx].grain_size)
+                            * SECTOR_SIZE;
+
+                    if !callback(virtual_byte, &grain_data) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Read for VmdkDisk {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let offset = self.cursor;

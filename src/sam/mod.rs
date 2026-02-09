@@ -39,7 +39,38 @@ pub fn extract_sam_hashes(path: &Path) -> Result<Vec<SamEntry>> {
 /// Extract both SAM hashes and LSA secrets from a disk image.
 pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
     let mut disk = crate::disk::open_disk(path)?;
-    extract_secrets_from_reader(&mut disk)
+    match extract_secrets_from_reader(&mut disk) {
+        Ok(secrets) => return Ok(secrets),
+        Err(e) => {
+            log::info!("Standard extraction failed: {}", e);
+        }
+    }
+
+    // Fallback 3 (VMDK only): scan allocated grains directly.
+    // This is faster for incomplete VMDK images (missing extents) since it
+    // only reads physically present grain data instead of the full virtual disk.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "vmdk" {
+        log::info!("Trying VMDK grain-direct scan for registry hives");
+        let mut vmdk = crate::disk::vmdk::VmdkDisk::open(path)?;
+        match scan_vmdk_grains_for_hives(&mut vmdk) {
+            Ok((sam_data, system_data, security_data)) => {
+                return process_hive_data(sam_data, system_data, security_data);
+            }
+            Err(e) => {
+                log::info!("VMDK grain scan failed: {}", e);
+                return Err(e);
+            }
+        }
+    }
+
+    Err(crate::error::GovmemError::DecryptionError(
+        "All extraction methods failed".to_string(),
+    ))
 }
 
 /// Extract SAM hashes + LSA secrets from any Read+Seek source.
@@ -695,11 +726,10 @@ fn try_read_hbin_hive<R: Read + Seek>(
         return None;
     }
 
-    let flags = u16::from_le_bytes(first_block[cell_off + 6..cell_off + 8].try_into().unwrap());
-    // Must have KEY_HIVE_ENTRY (0x04) flag
-    if flags & 0x04 == 0 {
-        return None;
-    }
+    // Note: we do NOT check KEY_HIVE_ENTRY (0x04) flag here.
+    // Some hives (e.g. SAM) only set KEY_COMP_NAME (0x20) on their root key.
+    // Since we already filtered for hbin offset_in_hive==0, the NK cell at
+    // offset 0x20 IS the root key by definition.
 
     let name_len =
         u16::from_le_bytes(first_block[cell_off + 0x4C..cell_off + 0x4E].try_into().unwrap())
@@ -748,9 +778,15 @@ fn try_read_hbin_hive<R: Read + Seek>(
             break;
         }
 
+        let hbin_hive_off =
+            u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
         let block_size =
             u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
         if block_size < 0x1000 || block_size > 0x100000 {
+            break;
+        }
+        // Validate offset_in_hive matches accumulated data
+        if hbin_hive_off != hbin_data.len() {
             break;
         }
 
@@ -806,4 +842,329 @@ fn try_read_hbin_hive<R: Read + Seek>(
     );
 
     Some((name, hive_data))
+}
+
+// ---------------------------------------------------------------------------
+// VMDK grain-direct scan: bypasses LBA translation to read only allocated grains
+// ---------------------------------------------------------------------------
+
+/// Scan all physically allocated VMDK grains for registry hive signatures.
+///
+/// Two-phase approach:
+/// 1. Fast grain scan to collect candidate positions (regf headers, hbin roots)
+/// 2. Use VmdkDisk seek/read to assemble full hive data from virtual disk space
+///
+/// This handles both contiguous hives (regf+hbin in sequence) and fragmented
+/// hives (regf at one disk location, hbin data at another due to NTFS fragmentation).
+fn scan_vmdk_grains_for_hives(
+    vmdk: &mut crate::disk::vmdk::VmdkDisk,
+) -> Result<HiveFiles> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    log::info!("Starting VMDK grain-direct scan for registry hives");
+
+    let mut grains_scanned = 0u64;
+
+    // Phase 1: Collect candidates from grain data
+    // regf candidates: (virtual_offset, bins_size)
+    let mut regf_candidates: Vec<(u64, u64)> = Vec::new();
+    // hbin(0) candidates: (virtual_offset, name)
+    let mut hbin_root_candidates: Vec<(u64, String)> = Vec::new();
+
+    vmdk.scan_all_grains(|virtual_byte, grain_data| {
+        grains_scanned += 1;
+
+        let mut pos = 0;
+        while pos + CLUSTER_SIZE <= grain_data.len() {
+            let chunk = &grain_data[pos..];
+
+            // Check for "regf" signature
+            if pos + 0x2C <= grain_data.len() && chunk[0..4] == *b"regf" {
+                let bins_size =
+                    u32::from_le_bytes(chunk[0x28..0x2C].try_into().unwrap()) as u64;
+                if bins_size > 0 && bins_size <= MAX_HIVE_SIZE {
+                    regf_candidates.push((virtual_byte + pos as u64, bins_size));
+                }
+            }
+
+            // Check for "hbin" with hive-offset=0 (first block of a hive)
+            if pos + 0x80 <= grain_data.len() && chunk[0..4] == *b"hbin" {
+                let hbin_hive_off =
+                    u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let hbin_size =
+                    u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                if hbin_hive_off == 0 && (0x1000..=0x100000).contains(&hbin_size) {
+                    // Parse root NK cell — no KEY_HIVE_ENTRY flag check needed.
+                    // In the first hbin, the NK cell at offset 0x20 IS the root key.
+                    let cell_off = 0x20;
+                    if cell_off + 0x60 < chunk.len()
+                        && &chunk[cell_off + 4..cell_off + 6] == b"nk"
+                    {
+                        let name_len = u16::from_le_bytes(
+                            chunk[cell_off + 0x4C..cell_off + 0x4E]
+                                .try_into()
+                                .unwrap(),
+                        ) as usize;
+                        if name_len > 0 && cell_off + 0x50 + name_len <= chunk.len() {
+                            let name = String::from_utf8_lossy(
+                                &chunk[cell_off + 0x50..cell_off + 0x50 + name_len],
+                            )
+                            .to_uppercase();
+                            if matches!(name.as_str(), "SAM" | "SYSTEM" | "SECURITY") {
+                                log::info!(
+                                    "Grain scan: found {} hbin(0) at virt 0x{:x}+0x{:x}",
+                                    name,
+                                    virtual_byte,
+                                    pos,
+                                );
+                                hbin_root_candidates.push((
+                                    virtual_byte + pos as u64,
+                                    name,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            pos += CLUSTER_SIZE;
+        }
+        true // always scan all grains
+    })?;
+
+    log::info!(
+        "Grain scan complete: {} grains, {} regf candidates, {} hbin roots",
+        grains_scanned,
+        regf_candidates.len(),
+        hbin_root_candidates.len(),
+    );
+
+    // Phase 2: Try to read full hive data using VmdkDisk seek/read
+
+    let mut sam_data: Option<Vec<u8>> = None;
+    let mut system_data: Option<Vec<u8>> = None;
+    let mut security_data: Option<Vec<u8>> = None;
+
+    // 2a: Try regf candidates — read total_size bytes from virtual offset
+    for &(virt_off, bins_size) in &regf_candidates {
+        let total_size = (0x1000 + bins_size) as usize;
+        if vmdk.seek(SeekFrom::Start(virt_off)).is_err() {
+            continue;
+        }
+        let mut data = vec![0u8; total_size];
+        if vmdk.read_exact(&mut data).is_err() {
+            continue;
+        }
+        // Validate as hive
+        let h = match hive::Hive::new(&data) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let name = match h.root_key() {
+            Ok(r) => r.name().to_uppercase(),
+            Err(_) => continue,
+        };
+        let target = match name.as_str() {
+            "SAM" if sam_data.is_none() => &mut sam_data,
+            "SYSTEM" if system_data.is_none() && total_size as u64 >= MIN_SYSTEM_HIVE_SIZE => {
+                &mut system_data
+            }
+            "SECURITY" if security_data.is_none() => &mut security_data,
+            _ => continue,
+        };
+        log::info!(
+            "Grain scan: read {} hive at virt 0x{:x} ({} bytes)",
+            name, virt_off, total_size
+        );
+        *target = Some(data);
+
+        if sam_data.is_some() && system_data.is_some() {
+            break;
+        }
+    }
+
+    if sam_data.is_some() && system_data.is_some() {
+        return Ok((sam_data.unwrap(), system_data.unwrap(), security_data));
+    }
+
+    // 2b: Try hbin root candidates — read contiguous hbin blocks via VmdkDisk
+    for (hbin_virt, name) in &hbin_root_candidates {
+        let target = match name.as_str() {
+            "SAM" if sam_data.is_none() => &mut sam_data,
+            "SYSTEM" if system_data.is_none() => &mut system_data,
+            "SECURITY" if security_data.is_none() => &mut security_data,
+            _ => continue,
+        };
+
+        // Read contiguous hbin blocks from virtual disk, validating offset_in_hive
+        let mut hbin_data = Vec::new();
+        let mut read_offset = *hbin_virt;
+        let mut hbin_buf = [0u8; CLUSTER_SIZE];
+
+        loop {
+            if hbin_data.len() as u64 >= MAX_HIVE_SIZE {
+                break;
+            }
+            if vmdk.seek(SeekFrom::Start(read_offset)).is_err() {
+                break;
+            }
+            if vmdk.read_exact(&mut hbin_buf).is_err() {
+                break;
+            }
+            if &hbin_buf[0..4] != b"hbin" {
+                break;
+            }
+            let hbin_hive_off =
+                u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
+            let block_size =
+                u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
+            if block_size < 0x1000 || block_size > 0x100000 {
+                break;
+            }
+            // Validate offset_in_hive matches accumulated data
+            if hbin_hive_off != hbin_data.len() {
+                log::debug!(
+                    "hbin offset mismatch: expected 0x{:x}, got 0x{:x} — different hive, stopping",
+                    hbin_data.len(), hbin_hive_off
+                );
+                break;
+            }
+            // Read full block
+            let mut block = vec![0u8; block_size];
+            if vmdk.seek(SeekFrom::Start(read_offset)).is_err() {
+                break;
+            }
+            if vmdk.read_exact(&mut block).is_err() {
+                break;
+            }
+            hbin_data.extend_from_slice(&block);
+            read_offset += block_size as u64;
+        }
+
+        let contiguous_size = hbin_data.len();
+        if contiguous_size == 0 {
+            continue;
+        }
+
+        log::info!(
+            "Grain scan: {} hbin at virt 0x{:x}: {} contiguous bytes",
+            name, hbin_virt, contiguous_size
+        );
+
+        // Try to find a matching regf header from our candidates.
+        // Match by path substring, preferring config hive paths for SYSTEM/SAM/SECURITY.
+        let mut best_regf: Option<(u64, u64)> = None;
+        for &(roff, rbins) in &regf_candidates {
+            if vmdk.seek(SeekFrom::Start(roff + 0x30)).is_err() {
+                continue;
+            }
+            let mut path_buf = [0u8; 64];
+            if vmdk.read_exact(&mut path_buf).is_err() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(&path_buf)
+                .to_uppercase()
+                .replace('\0', "");
+            // Require "Config\NAME" pattern for system hives to avoid matching
+            // unrelated hives named "System" or "SAM" in other contexts.
+            let matches = match name.as_str() {
+                "SAM" => path.contains("CONFIG\\SAM") || path.ends_with("\\SAM"),
+                "SYSTEM" => path.contains("CONFIG\\SYSTEM") || (path == "SYSTEM"),
+                "SECURITY" => path.contains("CONFIG\\SECURITY"),
+                _ => false,
+            };
+            if matches {
+                if best_regf.is_none() || rbins > best_regf.unwrap().1 {
+                    best_regf = Some((roff, rbins));
+                }
+            }
+        }
+
+        // Build synthetic regf header + collected hbin data
+        let bins_size = if let Some((_, rbins)) = best_regf {
+            rbins as u32
+        } else {
+            hbin_data.len() as u32
+        };
+
+        let mut regf_hdr = vec![0u8; 0x1000];
+        regf_hdr[0..4].copy_from_slice(b"regf");
+        regf_hdr[0x24..0x28].copy_from_slice(&0x20u32.to_le_bytes());
+        regf_hdr[0x28..0x2C].copy_from_slice(&bins_size.to_le_bytes());
+        if let Some((roff, _)) = best_regf {
+            if vmdk.seek(SeekFrom::Start(roff)).is_ok() {
+                let mut real_hdr = [0u8; 0x30];
+                if vmdk.read_exact(&mut real_hdr).is_ok() {
+                    regf_hdr[0x04..0x30].copy_from_slice(&real_hdr[0x04..0x30]);
+                }
+            }
+        }
+
+        let mut hive_data = regf_hdr;
+        // If contiguous data is less than bins_size, pad with zeros (fragmented hive)
+        if (contiguous_size as u32) < bins_size {
+            hbin_data.resize(bins_size as usize, 0);
+        }
+        let actual_bins = bins_size.min(hbin_data.len() as u32);
+        hive_data.extend_from_slice(&hbin_data[..actual_bins as usize]);
+
+        // Validate the reconstructed hive is parseable and has expected content
+        let hive_ok = if let Ok(h) = hive::Hive::new(&hive_data) {
+            if let Ok(root) = h.root_key() {
+                let rname = root.name().to_uppercase();
+                match rname.as_str() {
+                    "SYSTEM" => root.subkey(&h, "Select").is_ok(),
+                    "SAM" => root.subkey(&h, "Domains").is_ok(),
+                    "SECURITY" => root.subkey(&h, "Policy").is_ok(),
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if hive_ok {
+            log::info!(
+                "Grain scan: valid {} hive from hbin at virt 0x{:x} ({} bytes, {} contiguous of {})",
+                name,
+                hbin_virt,
+                hive_data.len(),
+                contiguous_size,
+                bins_size,
+            );
+            *target = Some(hive_data);
+        } else {
+            log::debug!(
+                "Grain scan: {} hbin at 0x{:x} failed validation ({} contiguous of {} needed)",
+                name, hbin_virt, contiguous_size, bins_size,
+            );
+        }
+    }
+
+    let has_sam = sam_data.is_some();
+    let has_system = system_data.is_some();
+    if let (Some(sam), Some(system)) = (sam_data, system_data) {
+        Ok((sam, system, security_data))
+    } else {
+        let mut detail = "VMDK grain scan:".to_string();
+        if !has_sam {
+            detail.push_str(" SAM not found");
+        }
+        if !has_system {
+            if !has_sam {
+                detail.push_str(",");
+            }
+            detail.push_str(" SYSTEM not found");
+        }
+        if !regf_candidates.is_empty() || !hbin_root_candidates.is_empty() {
+            detail.push_str(&format!(
+                " ({} regf headers, {} hbin roots found but hives fragmented by NTFS)",
+                regf_candidates.len(),
+                hbin_root_candidates.len()
+            ));
+        }
+        Err(crate::error::GovmemError::DecryptionError(detail))
+    }
 }
