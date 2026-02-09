@@ -101,8 +101,8 @@ pub fn offsets_for_build(build: u32) -> Result<EprocessOffsets> {
         9600 => Ok(WIN81_X64_EPROCESS),
         // Win10 1507-1607 / Server 2016
         10240..=14393 => Ok(WIN10_EARLY_X64_EPROCESS),
-        // Win10 1703-22H2 / Server 2019/2022 / Win11
-        15063..=26100 => Ok(WIN10_X64_EPROCESS),
+        // Win10 1703+ / Server 2019/2022/2025 / Win11 (builds 15063-26100+)
+        15063..=29999 => Ok(WIN10_X64_EPROCESS),
         _ => Err(GovmemError::UnsupportedBuild(build)),
     }
 }

