@@ -57,10 +57,19 @@ pub fn extract_wdigest_credentials(
         patterns::WDIGEST_LOGON_SESSION_PATTERNS,
         "wdigest_l_LogSessList",
     ) {
-        Ok((pattern_addr, _)) => find_wdigest_list(vmem, pattern_addr)?,
+        Ok((pattern_addr, _)) => {
+            let addr = find_wdigest_list(vmem, pattern_addr)?;
+            // Validate: flink should be a valid heap pointer or self-reference
+            let flink = vmem.read_virt_u64(addr).unwrap_or(0);
+            if flink != 0 && flink != addr && (flink >> 48) == 0 && flink > 0x10000 {
+                addr
+            } else {
+                log::info!("Pattern-resolved l_LogSessList at 0x{:x} has invalid flink 0x{:x}, falling back to .data scan", addr, flink);
+                find_wdigest_list_in_data(vmem, &pe, wdigest_base, keys)?
+            }
+        }
         Err(e) => {
             log::info!("Code pattern scan failed (likely paged out): {}", e);
-            // Fallback: scan .data section for LIST_ENTRY heads
             find_wdigest_list_in_data(vmem, &pe, wdigest_base, keys)?
         }
     };

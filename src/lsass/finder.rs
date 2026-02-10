@@ -142,12 +142,29 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     // Extract credentials from each provider, tracking status for summary
     let mut all_creds: std::collections::HashMap<u64, Credential> = std::collections::HashMap::new();
 
+    // First: discover all logon sessions from MSV list walk (even without credentials)
+    if let Some(msv) = &dlls.msv1_0 {
+        let sessions = crate::lsass::msv::extract_msv_sessions(&lsass_vmem, msv.base, msv.size);
+        log::info!("MSV sessions discovered: {}", sessions.len());
+        for sess in sessions {
+            all_creds.entry(sess.luid).or_insert_with(|| {
+                let mut c = Credential::new_empty(sess.luid, sess.username.clone(), sess.domain.clone());
+                c.logon_type = sess.logon_type;
+                c.session_id = sess.session_id;
+                c.logon_time = sess.logon_time;
+                c.logon_server = sess.logon_server.clone();
+                c.sid = sess.sid.clone();
+                c
+            });
+        }
+    }
+
     // Provider status: "ok", "paged", "empty", "n/a"
     let mut msv_status = "paged";
     let mut wdigest_status = "paged";
     let mut kerberos_status = "paged";
     let mut tspkg_status = "paged";
-    let mut dpapi_status = "paged";
+    let dpapi_status;
     let mut ssp_status = "empty";
     let mut livessp_status = if dlls.livessp.is_some() { "paged" } else { "n/a" };
     let mut credman_status = "paged";
@@ -243,21 +260,23 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     }
 
     // DPAPI (uses lsasrv.dll)
-    match crate::lsass::dpapi::extract_dpapi_credentials(&lsass_vmem, lsasrv.base, lsasrv.size, &keys) {
-        Ok(creds) => {
-            if creds.is_empty() {
-                dpapi_status = "empty";
-            } else {
-                dpapi_status = "ok";
-            }
-            for (luid, dpapi_cred) in creds {
-                let entry = all_creds.entry(luid).or_insert_with(|| {
-                    Credential::new_empty(luid, String::new(), String::new())
-                });
-                entry.dpapi.push(dpapi_cred);
-            }
+    let dpapi_creds = match crate::lsass::dpapi::extract_dpapi_credentials(&lsass_vmem, lsasrv.base, lsasrv.size, &keys) {
+        Ok(creds) if !creds.is_empty() => creds,
+        Ok(_) | Err(_) => {
+            log::info!("DPAPI: standard extraction found nothing, trying physical scan...");
+            crate::lsass::dpapi::extract_dpapi_physical_scan(phys, lsass.dtb, &lsass_vmem, &keys)
         }
-        Err(e) => log::info!("DPAPI extraction failed: {}", e),
+    };
+    if dpapi_creds.is_empty() {
+        dpapi_status = "empty";
+    } else {
+        dpapi_status = "ok";
+    }
+    for (luid, dpapi_cred) in dpapi_creds {
+        let entry = all_creds.entry(luid).or_insert_with(|| {
+            Credential::new_empty(luid, String::new(), String::new())
+        });
+        entry.dpapi.push(dpapi_cred);
     }
 
     // Credman (uses msv1_0.dll - walks MSV logon session list for CredentialManager pointers)
@@ -381,6 +400,9 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                     domain: msv_cred.domain.clone(),
                     logon_type: 0,
                     session_id: 0,
+                    logon_time: 0,
+                    logon_server: String::new(),
+                    sid: String::new(),
                     msv: Some(msv_cred),
                     wdigest: orphan.wdigest,
                     kerberos: orphan.kerberos,

@@ -25,6 +25,25 @@ fn filetime_to_string(ft: u64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m + 1, rem + 1, hours, mins, secs)
 }
 
+/// Human-readable Windows logon type.
+fn logon_type_name(lt: u32) -> &'static str {
+    match lt {
+        0 => "UndefinedLogonType",
+        2 => "Interactive",
+        3 => "Network",
+        4 => "Batch",
+        5 => "Service",
+        7 => "Unlock",
+        8 => "NetworkCleartext",
+        9 => "NewCredentials",
+        10 => "RemoteInteractive",
+        11 => "CachedInteractive",
+        12 => "CachedRemoteInteractive",
+        13 => "CachedUnlock",
+        _ => "Unknown",
+    }
+}
+
 /// Aggregated credential for a logon session.
 #[derive(Debug)]
 pub struct Credential {
@@ -33,6 +52,9 @@ pub struct Credential {
     pub domain: String,
     pub logon_type: u32,
     pub session_id: u32,
+    pub logon_time: u64,
+    pub logon_server: String,
+    pub sid: String,
     pub msv: Option<MsvCredential>,
     pub wdigest: Option<WdigestCredential>,
     pub kerberos: Option<KerberosCredential>,
@@ -126,6 +148,7 @@ pub struct DpapiCredential {
     pub guid: String,
     pub key: Vec<u8>,
     pub key_size: u32,
+    pub sha1_masterkey: [u8; 20],
 }
 
 /// Credential Manager saved credential.
@@ -170,6 +193,9 @@ impl Credential {
             domain,
             logon_type: 0,
             session_id: 0,
+            logon_time: 0,
+            logon_server: String::new(),
+            sid: String::new(),
             msv: None,
             wdigest: None,
             kerberos: None,
@@ -206,8 +232,20 @@ impl std::fmt::Display for Credential {
             _ => "",
         };
         writeln!(f, "  LUID: 0x{:x}{}", self.luid, luid_label)?;
+        if self.session_id != 0 || self.logon_type != 0 {
+            writeln!(f, "  Session: {} | LogonType: {}", self.session_id, logon_type_name(self.logon_type))?;
+        }
         writeln!(f, "  Username: {}", self.username)?;
         writeln!(f, "  Domain: {}", self.domain)?;
+        if !self.logon_server.is_empty() {
+            writeln!(f, "  LogonServer: {}", self.logon_server)?;
+        }
+        if self.logon_time != 0 {
+            writeln!(f, "  LogonTime: {}", filetime_to_string(self.logon_time))?;
+        }
+        if !self.sid.is_empty() {
+            writeln!(f, "  SID: {}", self.sid)?;
+        }
         if !self.has_credentials() {
             writeln!(f, "  (no credentials extracted - paged out)")?;
             return Ok(());
@@ -217,6 +255,7 @@ impl std::fmt::Display for Credential {
             writeln!(f, "    LM Hash : {}", hex::encode(msv.lm_hash))?;
             writeln!(f, "    NT Hash : {}", hex::encode(msv.nt_hash))?;
             writeln!(f, "    SHA1    : {}", hex::encode(msv.sha1_hash))?;
+            writeln!(f, "    DPAPI   : {}", hex::encode(msv.sha1_hash))?;
         }
         if let Some(wd) = &self.wdigest {
             if !wd.password.is_empty() {
@@ -245,12 +284,11 @@ impl std::fmt::Display for Credential {
             writeln!(f, "  [TsPkg]")?;
             writeln!(f, "    Password: {}", ts.password)?;
         }
-        if !self.dpapi.is_empty() {
+        for dk in &self.dpapi {
             writeln!(f, "  [DPAPI]")?;
-            for dk in &self.dpapi {
-                writeln!(f, "    GUID: {}", dk.guid)?;
-                writeln!(f, "    Key : {} ({} bytes)", hex::encode(&dk.key), dk.key_size)?;
-            }
+            writeln!(f, "    GUID          : {}", dk.guid)?;
+            writeln!(f, "    MasterKey     : {}", hex::encode(&dk.key))?;
+            writeln!(f, "    SHA1 MasterKey: {}", hex::encode(dk.sha1_masterkey))?;
         }
         if !self.credman.is_empty() {
             writeln!(f, "  [CredMan]")?;

