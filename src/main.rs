@@ -1,36 +1,41 @@
-#[cfg(not(any(feature = "vmware", feature = "vbox", feature = "sam")))]
-compile_error!("At least one backend must be enabled: --features vmware, vbox, and/or sam");
+#[cfg(not(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv", feature = "sam")))]
+compile_error!("At least one backend must be enabled: --features vmware, vbox, qemu, hyperv, and/or sam");
 
 use std::path::Path;
 
 use anyhow::Context;
 use clap::Parser;
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 use vmkatz::lsass;
 use vmkatz::lsass::finder::PagefileRef;
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 use vmkatz::lsass::types::Credential;
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 use vmkatz::memory::PhysicalMemory;
 #[cfg(feature = "vbox")]
 use vmkatz::vbox::VBoxLayer;
 #[cfg(feature = "vmware")]
 use vmkatz::vmware::VmwareLayer;
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(feature = "qemu")]
+use vmkatz::qemu::QemuElfLayer;
+#[cfg(feature = "hyperv")]
+use vmkatz::hyperv::HypervLayer;
 // EPROCESS offsets auto-detected at runtime from ALL_EPROCESS_OFFSETS
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 use vmkatz::windows::process;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "vmkatz",
     version,
-    about = "VM memory forensics - extract credentials from VMware/VirtualBox/Hyper-V snapshots and disk images",
+    about = "VM memory forensics - extract credentials from VMware/VirtualBox/QEMU/Hyper-V snapshots and disk images",
     long_about = "vmkatz extracts Windows credentials from virtual machine memory snapshots and disk images.\n\n\
         Supported inputs:\n  \
         - VMware snapshots (.vmsn + .vmem)\n  \
         - VirtualBox saved states (.sav)\n  \
+        - QEMU/KVM/Proxmox ELF core dumps (.elf, from dump-guest-memory / virsh dump)\n  \
+        - Hyper-V legacy saved states (.bin) and raw memory dumps (.raw, .dmp)\n  \
         - Disk images for SAM hashes (.vdi, .vmdk, .qcow2, .vhdx, .vhd)\n  \
         - VM directories (auto-discovers all files)\n\n\
         Target: Windows 7 SP1 through Windows 11 x64",
@@ -283,7 +288,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(not(feature = "sam"))]
     let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = Default::default();
 
-    #[cfg(any(feature = "vmware", feature = "vbox"))]
+    #[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
     for file in &discovery.lsass_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
         println!("\n[*] LSASS: {}", name);
@@ -313,73 +318,183 @@ fn run_lsass(input_path: &Path, args: &Args, pagefile: PagefileRef<'_>, disk_pat
     let verbose = args.verbose || args.list_processes;
     let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    if ext.eq_ignore_ascii_case("sav") {
-        #[cfg(feature = "vbox")]
-        {
-            run_with_layer(
-                || {
-                    if verbose {
-                        println!("[*] Opening VirtualBox saved state: {}", input_path.display());
-                    }
-                    let layer = VBoxLayer::open(input_path)
-                        .context("Failed to open VirtualBox .sav file")?;
-                    if verbose {
-                        println!("[+] RAM: {} MB ({} pages mapped)", layer.phys_size() / (1024 * 1024), layer.page_count());
-                    }
-                    Ok(layer)
-                },
-                args,
-                verbose,
-                pagefile,
-                disk_path,
-            )
-        }
-        #[cfg(not(feature = "vbox"))]
-        {
-            let _ = (pagefile, disk_path);
-            anyhow::bail!("VirtualBox .sav support not enabled (compile with --features vbox)")
-        }
-    } else {
-        #[cfg(feature = "vmware")]
-        {
-            run_with_layer(
-                || {
-                    if verbose {
-                        println!("[*] Opening VMware memory dump: {}", input_path.display());
-                    }
-                    let layer = VmwareLayer::open(input_path)
-                        .context("Failed to open VMware memory dump")?;
-                    if verbose {
-                        println!("[+] VMEM mapped: {} MB", layer.phys_size() / (1024 * 1024));
-                        println!("[+] Memory regions: {}", layer.regions.len());
-                        for (i, region) in layer.regions.iter().enumerate() {
-                            println!(
-                                "    Region {}: guest=0x{:x} vmem=0x{:x} pages=0x{:x} ({}MB)",
-                                i,
-                                region.guest_page_num,
-                                region.vmem_page_num,
-                                region.page_count,
-                                (region.page_count * 0x1000) / (1024 * 1024)
-                            );
+    // Detect format by extension and magic bytes
+    let format = detect_lsass_format(input_path, ext);
+
+    match format {
+        LsassFormat::VBox => {
+            #[cfg(feature = "vbox")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            println!("[*] Opening VirtualBox saved state: {}", input_path.display());
                         }
-                    }
-                    Ok(layer)
-                },
-                args,
-                verbose,
-                pagefile,
-                disk_path,
-            )
+                        let layer = VBoxLayer::open(input_path)
+                            .context("Failed to open VirtualBox .sav file")?;
+                        if verbose {
+                            println!("[+] RAM: {} MB ({} pages mapped)", layer.phys_size() / (1024 * 1024), layer.page_count());
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "vbox"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("VirtualBox .sav support not enabled (compile with --features vbox)")
+            }
         }
-        #[cfg(not(feature = "vmware"))]
-        {
-            let _ = (pagefile, disk_path);
-            anyhow::bail!("VMware .vmem/.vmsn support not enabled (compile with --features vmware)")
+        LsassFormat::QemuElf => {
+            #[cfg(feature = "qemu")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            println!("[*] Opening QEMU ELF core dump: {}", input_path.display());
+                        }
+                        let layer = QemuElfLayer::open(input_path)
+                            .context("Failed to open QEMU ELF core dump")?;
+                        if verbose {
+                            println!("[+] ELF: {} MB physical, {} PT_LOAD segments",
+                                layer.phys_size() / (1024 * 1024), layer.segment_count());
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "qemu"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("QEMU ELF support not enabled (compile with --features qemu)")
+            }
+        }
+        LsassFormat::HypervBin => {
+            #[cfg(feature = "hyperv")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            println!("[*] Opening Hyper-V memory dump: {}", input_path.display());
+                        }
+                        let layer = HypervLayer::open(input_path)
+                            .context("Failed to open Hyper-V .bin memory dump")?;
+                        if verbose {
+                            println!("[+] RAM: {} MB identity-mapped", layer.phys_size() / (1024 * 1024));
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "hyperv"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("Hyper-V support not enabled (compile with --features hyperv)")
+            }
+        }
+        LsassFormat::Vmware => {
+            #[cfg(feature = "vmware")]
+            {
+                run_with_layer(
+                    || {
+                        if verbose {
+                            println!("[*] Opening VMware memory dump: {}", input_path.display());
+                        }
+                        let layer = VmwareLayer::open(input_path)
+                            .context("Failed to open VMware memory dump")?;
+                        if verbose {
+                            println!("[+] VMEM mapped: {} MB", layer.phys_size() / (1024 * 1024));
+                            println!("[+] Memory regions: {}", layer.regions.len());
+                            for (i, region) in layer.regions.iter().enumerate() {
+                                println!(
+                                    "    Region {}: guest=0x{:x} vmem=0x{:x} pages=0x{:x} ({}MB)",
+                                    i,
+                                    region.guest_page_num,
+                                    region.vmem_page_num,
+                                    region.page_count,
+                                    (region.page_count * 0x1000) / (1024 * 1024)
+                                );
+                            }
+                        }
+                        Ok(layer)
+                    },
+                    args,
+                    verbose,
+                    pagefile,
+                    disk_path,
+                )
+            }
+            #[cfg(not(feature = "vmware"))]
+            {
+                let _ = (pagefile, disk_path);
+                anyhow::bail!("VMware .vmem/.vmsn support not enabled (compile with --features vmware)")
+            }
         }
     }
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+/// Format detection for LSASS memory snapshot files.
+enum LsassFormat {
+    VBox,
+    QemuElf,
+    HypervBin,
+    Vmware,
+}
+
+/// Detect the memory snapshot format from extension and magic bytes.
+fn detect_lsass_format(path: &Path, ext: &str) -> LsassFormat {
+    // Extension-based detection first
+    if ext.eq_ignore_ascii_case("sav") {
+        return LsassFormat::VBox;
+    }
+    if ext.eq_ignore_ascii_case("elf") {
+        return LsassFormat::QemuElf;
+    }
+    if ext.eq_ignore_ascii_case("bin") {
+        // Could be Hyper-V .bin or a raw dump — check for ELF magic
+        if has_elf_magic(path) {
+            return LsassFormat::QemuElf;
+        }
+        return LsassFormat::HypervBin;
+    }
+    if ext.eq_ignore_ascii_case("raw") {
+        // Raw memory dump — check for ELF magic (virsh dump can produce .raw)
+        if has_elf_magic(path) {
+            return LsassFormat::QemuElf;
+        }
+        return LsassFormat::HypervBin;
+    }
+
+    // For unknown extensions, try magic-based detection
+    if has_elf_magic(path) {
+        return LsassFormat::QemuElf;
+    }
+
+    // Default: VMware (.vmem, .vmsn, or anything else)
+    LsassFormat::Vmware
+}
+
+/// Check if file starts with ELF magic bytes (reads only 4 bytes).
+fn has_elf_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
+}
+
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     make_layer: F,
     args: &Args,
@@ -473,7 +588,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     Ok(())
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn find_process_by_name<'a>(
     processes: &'a [vmkatz::windows::process::Process],
     name: &str,
@@ -491,7 +606,7 @@ fn find_process_by_name<'a>(
         })
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn print_text(credentials: &[Credential]) {
     let with_creds = credentials.iter().filter(|c| c.has_credentials()).count();
     println!(
@@ -504,7 +619,7 @@ fn print_text(credentials: &[Credential]) {
     }
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn csv_escape(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -513,7 +628,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn print_csv(credentials: &[Credential]) {
     println!("luid,username,domain,nt_hash,lm_hash,sha1_hash,wdigest_password,kerberos_password,tspkg_password");
     for cred in credentials.iter().filter(|c| c.has_credentials()) {
@@ -557,7 +672,7 @@ fn print_csv(credentials: &[Credential]) {
     }
 }
 
-#[cfg(any(feature = "vmware", feature = "vbox"))]
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
 fn print_ntlm(credentials: &[Credential]) {
     let zero_hash = [0u8; 16];
     for cred in credentials.iter().filter(|c| c.has_credentials()) {

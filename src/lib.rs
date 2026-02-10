@@ -4,6 +4,10 @@ pub mod memory;
 pub mod vmware;
 #[cfg(feature = "vbox")]
 pub mod vbox;
+#[cfg(feature = "qemu")]
+pub mod qemu;
+#[cfg(feature = "hyperv")]
+pub mod hyperv;
 pub mod paging;
 pub mod windows;
 pub mod pe;

@@ -186,9 +186,25 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         if !msv_creds.is_empty() {
             msv_status = "ok";
         }
+        let mut next_synth_luid = 0x8000_0000_0000_0000u64;
         for (luid, msv_cred) in msv_creds {
-            let entry = all_creds.entry(luid).or_insert_with(|| {
-                Credential::new_empty(luid, msv_cred.username.clone(), msv_cred.domain.clone())
+            // When physical scan returns LUID=0, match by username+domain to existing session
+            let effective_luid = if luid == 0 {
+                all_creds.iter()
+                    .find(|(_, c)| c.username.eq_ignore_ascii_case(&msv_cred.username)
+                        && c.domain.eq_ignore_ascii_case(&msv_cred.domain)
+                        && c.msv.is_none())
+                    .map(|(&k, _)| k)
+                    .unwrap_or_else(|| {
+                        let synth = next_synth_luid;
+                        next_synth_luid += 1;
+                        synth
+                    })
+            } else {
+                luid
+            };
+            let entry = all_creds.entry(effective_luid).or_insert_with(|| {
+                Credential::new_empty(effective_luid, msv_cred.username.clone(), msv_cred.domain.clone())
             });
             entry.msv = Some(msv_cred);
         }

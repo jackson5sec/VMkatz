@@ -60,7 +60,7 @@ pub fn discover_vm_files(dir: &Path) -> Result<VmDiscovery> {
     })
 }
 
-/// Find .vmsn files with matching .vmem, and standalone .sav files.
+/// Find memory snapshot files: .vmsn+.vmem, .sav, .elf, .bin, .raw
 fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
     for file in all_files {
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -72,14 +72,51 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
                 out.push(file.clone());
             }
         } else if ext.eq_ignore_ascii_case("sav") {
-            // Skip empty .sav files (0 bytes = incomplete/placeholder snapshot)
+            // VirtualBox saved state - skip empty files
             if let Ok(meta) = file.metadata() {
                 if meta.len() > 0 {
                     out.push(file.clone());
                 }
             }
+        } else if ext.eq_ignore_ascii_case("elf") {
+            // QEMU ELF core dump (from dump-guest-memory / virsh dump --memory-only)
+            if is_elf_core(file) {
+                out.push(file.clone());
+            }
+        } else if ext.eq_ignore_ascii_case("bin") {
+            // Hyper-V legacy .bin or ELF dump with .bin extension
+            if let Ok(meta) = file.metadata() {
+                // Hyper-V .bin files are VM-RAM-sized; skip tiny metadata files
+                if meta.len() > 1024 * 1024 {
+                    out.push(file.clone());
+                }
+            }
+        } else if ext.eq_ignore_ascii_case("raw") {
+            // Raw memory dump (from MemProcFS export, etc.)
+            if let Ok(meta) = file.metadata() {
+                if meta.len() > 1024 * 1024 {
+                    out.push(file.clone());
+                }
+            }
         }
     }
+}
+
+/// Check if a file is an ELF core dump (magic + ET_CORE). Reads only 18 bytes.
+fn is_elf_core(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    let mut buf = [0u8; 18];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    // ELF magic: 7f 45 4c 46
+    if buf[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return false;
+    }
+    // e_type at offset 16 (u16 LE) should be ET_CORE (4)
+    let e_type = u16::from_le_bytes([buf[16], buf[17]]);
+    e_type == 4
 }
 
 /// Find the latest VMDK descriptor file for SAM extraction.

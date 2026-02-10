@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["vmware", "vbox", "sam"]
+default = ["vmware", "vbox", "qemu", "hyperv", "sam"]
 vmware = ["dep:memmap2"]
 vbox = []
+qemu = ["dep:memmap2"]
+hyperv = ["dep:memmap2"]
 sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
 
 [dependencies]
