@@ -95,6 +95,10 @@ pub fn find_system_process(
             };
             let dtb_base = dtb & 0x000F_FFFF_FFFF_F000;
             if dtb_base == 0 || dtb_base >= phys_size {
+                log::debug!(
+                    "System candidate at phys=0x{:x}: PID=4 but DTB=0x{:x} (base=0x{:x}) out of range (phys_size=0x{:x})",
+                    eprocess_phys, dtb, dtb_base, phys_size
+                );
                 off += 1;
                 continue;
             }
@@ -105,6 +109,10 @@ pub fn find_system_process(
                 Err(_) => { off += 1; continue; }
             };
             if (flink >> 48) != 0xFFFF {
+                log::debug!(
+                    "System candidate at phys=0x{:x}: PID=4, DTB=0x{:x}, but Flink=0x{:x} not canonical",
+                    eprocess_phys, dtb, flink
+                );
                 off += 1;
                 continue;
             }

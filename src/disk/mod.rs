@@ -1,4 +1,5 @@
 pub mod qcow2;
+pub mod raw;
 pub mod vdi;
 pub mod vhd;
 pub mod vhdx;
@@ -22,6 +23,17 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // Detect flat VMDK (e.g., "name-flat.vmdk") — raw disk, not sparse
+    if ext == "vmdk" && stem.ends_with("-flat") {
+        let disk = raw::RawDisk::open(path)?;
+        return Ok(Box::new(disk));
+    }
+
     match ext.as_str() {
         "vdi" => {
             let disk = vdi::VdiDisk::open(path)?;
@@ -41,6 +53,10 @@ pub fn open_disk(path: &Path) -> Result<Box<dyn DiskImage>> {
         }
         "vhd" => {
             let disk = vhd::VhdDisk::open(path)?;
+            Ok(Box::new(disk))
+        }
+        "raw" | "img" | "dd" => {
+            let disk = raw::RawDisk::open(path)?;
             Ok(Box::new(disk))
         }
         _ => Err(crate::error::GovmemError::ProcessNotFound(format!(

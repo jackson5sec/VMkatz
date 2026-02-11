@@ -82,7 +82,7 @@ struct Args {
     build: u32,
 
     /// Output format
-    #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm"])]
+    #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm", "hashcat"])]
     format: String,
 
     /// Verbose output (show memory regions, process list, etc.)
@@ -166,15 +166,19 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     match args.format.as_str() {
         "ntlm" => print_sam_ntlm(&secrets.sam_entries),
         "csv" => print_sam_csv(&secrets.sam_entries),
+        "hashcat" => print_sam_hashcat(&secrets.sam_entries),
         _ => print_sam_text(&secrets.sam_entries),
     }
 
-    if !secrets.lsa_secrets.is_empty() {
+    if !secrets.lsa_secrets.is_empty() && args.format != "hashcat" {
         print_lsa_secrets(&secrets.lsa_secrets);
     }
 
     if !secrets.cached_credentials.is_empty() {
-        print_cached_credentials(&secrets.cached_credentials);
+        match args.format.as_str() {
+            "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+            _ => print_cached_credentials(&secrets.cached_credentials),
+        }
     }
 
     Ok(())
@@ -217,6 +221,30 @@ fn print_sam_csv(entries: &[vmkatz::sam::SamEntry]) {
             entry.username,
             hex::encode(entry.nt_hash),
             hex::encode(entry.lm_hash),
+        );
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_sam_hashcat(entries: &[vmkatz::sam::SamEntry]) {
+    let zero_hash = [0u8; 16];
+    for entry in entries {
+        if entry.nt_hash != zero_hash {
+            // hashcat mode 1000 (NTLM)
+            println!("{}", hex::encode(entry.nt_hash));
+        }
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_dcc2_hashcat(creds: &[vmkatz::sam::cache::CachedCredential]) {
+    for cred in creds {
+        // hashcat mode 2100 (DCC2)
+        println!(
+            "$DCC2${}#{}#{}",
+            cred.iteration_count,
+            cred.username.to_lowercase(),
+            hex::encode(cred.dcc2_hash),
         );
     }
 }
@@ -505,11 +533,46 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     let layer = make_layer()?;
 
     // Find System process (auto-detect Windows version from EPROCESS layout)
-    let (system, eprocess_offsets) = process::find_system_process_auto(&layer)
-        .context("Failed to find System process")?;
+    match process::find_system_process_auto(&layer) {
+        Ok((system, eprocess_offsets)) => {
+            run_with_system(&layer, &system, &eprocess_offsets, args, verbose, pagefile, disk_path)
+        }
+        Err(_) => {
+            // EPT fallback: try to find nested hypervisor page tables (VBS/Hyper-V)
+            log::info!("System process not found in L1 physical memory, trying EPT scan...");
+            println!("[*] VBS detected: scanning for nested EPT...");
 
+            let (ept_pml4, l2_size) = vmkatz::paging::ept::find_ept_root(&layer)
+                .context("Failed to find System process (no EPT found — VBS not supported for this snapshot)")?;
+
+            println!(
+                "[+] EPT found at L1=0x{:x}, L2 size={} MB",
+                ept_pml4,
+                l2_size / (1024 * 1024)
+            );
+
+            let ept_layer = vmkatz::paging::ept::EptLayer::new(&layer, ept_pml4, l2_size);
+
+            let (system, eprocess_offsets) = process::find_system_process_auto(&ept_layer)
+                .context("Failed to find System process (even with EPT translation)")?;
+
+            run_with_system(&ept_layer, &system, &eprocess_offsets, args, verbose, pagefile, disk_path)
+        }
+    }
+}
+
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
+fn run_with_system<L: PhysicalMemory>(
+    layer: &L,
+    system: &vmkatz::windows::process::Process,
+    eprocess_offsets: &vmkatz::windows::offsets::EprocessOffsets,
+    args: &Args,
+    verbose: bool,
+    pagefile: PagefileRef<'_>,
+    disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
+) -> anyhow::Result<()> {
     // Enumerate all processes
-    let processes = process::enumerate_processes(&layer, &system, &eprocess_offsets)
+    let processes = process::enumerate_processes(layer, system, eprocess_offsets)
         .context("Failed to enumerate processes")?;
 
     if verbose {
@@ -540,7 +603,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
             target.name, target.pid, target.dtb
         );
 
-        vmkatz::dump::dump_process(&layer, target, args.build, output_path, pagefile, disk_path)?;
+        vmkatz::dump::dump_process(layer, target, args.build, output_path, pagefile, disk_path)?;
 
         let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
         println!(
@@ -567,7 +630,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 
     // Extract credentials
     let credentials =
-        lsass::finder::extract_all_credentials(&layer, lsass_proc, system.dtb, pagefile, disk_path)
+        lsass::finder::extract_all_credentials(layer, lsass_proc, system.dtb, pagefile, disk_path)
             .context("Credential extraction failed")?;
 
     // Report pagefile resolution stats
@@ -582,6 +645,7 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
     match args.format.as_str() {
         "csv" => print_csv(&credentials),
         "ntlm" => print_ntlm(&credentials),
+        "hashcat" => print_hashcat(&credentials),
         _ => print_text(&credentials),
     }
 
@@ -684,6 +748,19 @@ fn print_ntlm(credentials: &[Credential]) {
                     cred.username,
                     hex::encode(msv.nt_hash),
                 );
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "vmware", feature = "vbox", feature = "qemu", feature = "hyperv"))]
+fn print_hashcat(credentials: &[Credential]) {
+    let zero_hash = [0u8; 16];
+    for cred in credentials.iter().filter(|c| c.has_credentials()) {
+        // hashcat mode 1000 (NTLM)
+        if let Some(msv) = &cred.msv {
+            if msv.nt_hash != zero_hash {
+                println!("{}", hex::encode(msv.nt_hash));
             }
         }
     }
