@@ -2,6 +2,7 @@
 name = "vmkatz"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [features]
 default = ["vmware", "vbox", "qemu", "hyperv", "sam"]
