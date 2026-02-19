@@ -1,14 +1,18 @@
 # VMkatz
 
-## Why This Exists
+## Too Big to Steal
 
-You are on a red-team operation. You traverse a path through four or five proxies before you finally reach the target network. After several pivots across the infrastructure, you land on a NAS and expect treasure. You are right, but cursed: it stores virtual machines, not loose secrets.
+You are three weeks into a red team engagement. Your traffic crawls through a VPN, then bounces across four SOCKS proxies chained through compromised jump boxes before it touches the target network. Every packet takes the scenic route.
 
-The prize is there, but reality bites. Your link is barely 200 KB/s. Pulling a 100 GB VM would take days, and every minute of outbound transfer increases the chance that blue team telemetry lights up and your foothold burns.
+After days of lateral movement you land on a NAS attached to the virtualization cluster and the directory listing hits different: rows upon rows of `.vmdk`, `.vmsn`, `.sav`. Hundreds of gigabytes of virtual machines — domain controllers, admin workstations, the crown jewels — sitting right there.
 
-VMkatz is built for that moment. Instead of dragging entire virtual machines over a fragile line, it extracts high-value Windows secrets directly from VM memory snapshots and virtual disks, **in-place on the hypervisor**.
+But your link wheezes at 200 KB/s. Pulling a single 100 GB disk image would take **six days**, and every hour of sustained exfil is another chance the SOC spots the anomaly, burns your tunnel, and the whole chain collapses.
 
-It ships as a single static binary (~5 MB). Drop it on a NAS, ESXi host, or Proxmox node, point it at a `.vmsn`, `.sav`, `.vmdk`, or any VM folder, and walk away with NTLM hashes, DPAPI master keys, Kerberos tickets, cached domain credentials, LSA secrets, and NTDS.dit extracts.
+Without VMkatz, the traditional workflow looks like this: exfiltrate the entire VM disk or memory snapshot, mount it locally, install a full Windows analysis stack, load the snapshot into a debugger or use mimikatz on a booted copy, and manually piece together credentials from each VM — one at a time. Multiply that by a dozen VMs on the cluster and you are looking at days of bandwidth, tooling, and post-processing.
+
+VMkatz exists because you shouldn't have to exfiltrate what you can read in place. It extracts Windows secrets — NTLM hashes, DPAPI master keys, Kerberos tickets, cached domain credentials, LSA secrets, NTDS.dit — directly from VM memory snapshots and virtual disks, **on the NAS, the hypervisor, wherever the VM files are**.
+
+A single static binary, ~5 MB. Drop it on the ESXi host, the Proxmox node, or the NAS. Point it at a `.vmsn`, `.vmdk`, or an entire VM folder. Walk away with credentials, not disk images.
 
 ## What It Extracts
 
@@ -227,7 +231,3 @@ cargo build --release --no-default-features --features "sam ntds.dit"
 4. **LSASS extraction**: Locates `lsass.exe`, maps its virtual address space, finds DLLs (`lsass.dll`, `msv1_0.dll`, `wdigest.dll`, `kerberos.dll`, etc.) via PEB/LDR enumeration, resolves crypto keys via pattern matching on `.text`/`.data` sections, and decrypts credentials in-memory using 3DES-CBC or AES-CBC (auto-detected by buffer alignment).
 
 5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key.
-
-## Disclaimer
-
-Use only on systems you are explicitly authorized to assess.
