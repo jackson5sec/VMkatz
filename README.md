@@ -223,6 +223,7 @@ Tested across 7 Windows versions and 4 hypervisors.
 | Proxmox 8 | Windows Server 2016 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | Live + stopped VMs |
 | Proxmox 8 | Windows Server 2019 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | 3 VMs, incl. DCs |
 | Proxmox 8 | Windows Server 2025 x64 | SAM / LSA (LVM block device) | PASS | Template VM |
+| Proxmox 8 | Windows 11 x64 | SAM / LSA (LVM block device) | PASS | Live VM |
 
 ### Known limitations
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works when the VM is powered off.
