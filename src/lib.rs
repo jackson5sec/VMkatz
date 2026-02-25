@@ -11,6 +11,8 @@ pub mod paging;
 pub mod pe;
 #[cfg(feature = "qemu")]
 pub mod qemu;
+#[cfg(feature = "ntds.dit")]
+pub mod ntds;
 #[cfg(feature = "sam")]
 pub mod sam;
 #[cfg(feature = "vbox")]

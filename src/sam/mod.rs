@@ -3,7 +3,6 @@ pub mod cache;
 pub mod hashes;
 pub mod hive;
 pub mod lsa;
-pub mod ntds;
 mod ntfs_fallback;
 
 use std::collections::HashMap;

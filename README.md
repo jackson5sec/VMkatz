@@ -40,7 +40,7 @@ All 9 SSP credential providers that mimikatz implements:
 - **SAM hashes**: Local account NT/LM hashes
 - **LSA secrets**: Service account passwords, auto-logon credentials, machine account keys
 - **Cached domain credentials**: DCC2 hashes (last N domain logons)
-- **NTDS.dit**: Full Active Directory hash extraction from domain controller disks (feature-gated)
+- **NTDS.dit**: Full Active Directory hash extraction from domain controller disks, natively from the ESE database - no impacket or external tools needed
 
 ## Supported Inputs
 
@@ -62,7 +62,7 @@ All 9 SSP credential providers that mimikatz implements:
 ## Quick Start
 
 ```bash
-# Build (default features: all hypervisors + disk support)
+# Build (default features: all hypervisors + disk + NTDS)
 cargo build --release
 
 # Extract LSASS credentials from a VMware snapshot
@@ -73,6 +73,12 @@ cargo build --release
 
 # Extract SAM/LSA/DCC2 from a virtual disk (auto-detected)
 ./vmkatz disk.vmdk
+
+# Extract AD hashes from a domain controller disk (NTDS.dit)
+./vmkatz --ntds /dev/pve/vm-102-disk-0
+
+# Extract AD hashes with password history
+./vmkatz --ntds --ntds-history dc-disk.qcow2
 
 # Point at a VM folder and let it find everything
 ./vmkatz /path/to/vm-directory/
@@ -136,6 +142,24 @@ $ vmkatz --format hashcat snapshot.vmsn
 bbf7d1528afa8b0fdd40a5b2531bbb6d
 ```
 
+### NTDS.dit extraction
+```
+$ vmkatz --ntds /dev/pve/vm-102-disk-0
+
+[+] NTDS Artifacts:
+  Partition offset : 0x100000
+  ntds.dit size    : 20971520 bytes
+  SYSTEM size      : 14155776 bytes
+  Bootkey          : 9ae365ba5244457bfc2a26187a28346a
+  Hashes extracted : 18
+
+[+] AD NTLM Hashes:
+  RID: 500    Administrator            current    NT:c66d72021a2d4744409969a581a1705e  LM:00000000000000000000000000000000
+  RID: 502    krbtgt                   current    NT:9c238cafb7b4447e5f701c71dbdcf636  LM:00000000000000000000000000000000
+  RID: 1000   vagrant                  current    NT:e02bc503339d51f71d913c245d35b50b  LM:00000000000000000000000000000000
+  ...
+```
+
 ### Pagefile resolution
 ```
 $ vmkatz --disk disk.vmdk snapshot.vmsn
@@ -183,19 +207,16 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `qemu` | QEMU/KVM ELF core dump support | Yes |
 | `hyperv` | Hyper-V `.bin`/`.raw` dump support | Yes |
 | `sam` | Disk extraction (SAM/LSA/DCC2) and disk format handlers | Yes |
-| `ntds.dit` | NTDS.dit AD extraction (`--ntds`, `--ntds-history`). Requires `sam` | No |
+| `ntds.dit` | NTDS.dit AD extraction (`--ntds`, `--ntds-history`). Requires `sam` | Yes |
 
 ```bash
-# Default build (all hypervisors + disk)
+# Default build (all hypervisors + disk + NTDS)
 cargo build --release
-
-# Add NTDS support
-cargo build --release --features "ntds.dit"
 
 # Memory-only build (no disk handling, smaller binary)
 cargo build --release --no-default-features --features "vmware vbox qemu hyperv"
 
-# Disk-only build with NTDS
+# Disk-only build (SAM + NTDS, no memory snapshot support)
 cargo build --release --no-default-features --features "sam ntds.dit"
 ```
 
@@ -222,7 +243,9 @@ Tested across 7 Windows versions and 4 hypervisors.
 | ESXi 8.0 | Windows 11 x64 (VBS) | LSASS (`.vmsn`) | FAIL | Credential Guard / VBS |
 | Proxmox 8 | Windows Server 2016 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | Live + stopped VMs |
 | Proxmox 8 | Windows Server 2019 x64 | SAM / LSA / DCC2 (LVM block device) | PASS | 3 VMs, incl. DCs |
-| Proxmox 8 | Windows Server 2025 x64 | SAM / LSA (LVM block device) | PASS | Template VM |
+| Proxmox 8 | Windows Server 2019 x64 | NTDS.dit (LVM block device) | PASS | 3 DCs (GOAD lab), 8KB pages, verified against impacket |
+| Proxmox 8 | Windows Server 2025 x64 | SAM / LSA (LVM block device) | PASS | |
+| Proxmox 8 | Windows Server 2025 x64 | NTDS.dit (LVM block device) | PASS | 32KB pages, native ESE parsing |
 | Proxmox 8 | Windows 11 x64 | SAM / LSA (LVM block device) | PASS | Live VM |
 
 ### Known limitations
@@ -241,3 +264,5 @@ Tested across 7 Windows versions and 4 hypervisors.
 4. **LSASS extraction**: Locates `lsass.exe`, maps its virtual address space, finds DLLs (`lsass.dll`, `msv1_0.dll`, `wdigest.dll`, `kerberos.dll`, etc.) via PEB/LDR enumeration, resolves crypto keys via pattern matching on `.text`/`.data` sections, and decrypts credentials in-memory using 3DES-CBC or AES-CBC (auto-detected by buffer alignment).
 
 5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key.
+
+6. **NTDS extraction**: For domain controllers (`--ntds`), locates `NTDS.dit` and the `SYSTEM` hive on disk, then parses the ESE (JET Blue) database natively. Traverses B+ trees to read the `datatable`, extracts the PEK (Password Encryption Key) using the bootkey, and decrypts NT/LM hashes for every AD account. Supports both 8KB pages (Windows Server 2019 and earlier) and 32KB large pages (Windows Server 2025), as well as RC4 (legacy), AES pre-Win2016, and AES Win2016+ (v0x13) hash blob formats.

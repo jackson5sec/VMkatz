@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["vmware", "vbox", "qemu", "hyperv", "sam"]
+default = ["vmware", "vbox", "qemu", "hyperv", "sam", "ntds.dit"]
 vmware = ["dep:memmap2"]
 vbox = []
 qemu = ["dep:memmap2"]

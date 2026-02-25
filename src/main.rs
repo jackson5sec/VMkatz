@@ -245,9 +245,9 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     let artifacts = vmkatz::sam::extract_ntds_artifacts(input_path)
         .context("NTDS artifact extraction failed")?;
-    let ctx = vmkatz::sam::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
+    let ctx = vmkatz::ntds::build_context(&artifacts.ntds_data, &artifacts.system_data)
         .context("NTDS context validation failed")?;
-    let hashes = vmkatz::sam::ntds::extract_ad_hashes(
+    let hashes = vmkatz::ntds::extract_ad_hashes(
         &artifacts.ntds_data,
         &artifacts.system_data,
         args.ntds_history,
@@ -272,7 +272,7 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "ntds.dit")]
-fn print_ntds_text(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
+fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry]) {
     println!("\n[+] AD NTLM Hashes:");
     for entry in entries {
         let hist = if entry.is_history {
@@ -295,7 +295,7 @@ fn print_ntds_text(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "ntds.dit")]
-fn print_ntds_ntlm(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
+fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
     for entry in entries {
         let user = if entry.is_history {
             match entry.history_index {
@@ -317,7 +317,7 @@ fn print_ntds_ntlm(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "ntds.dit")]
-fn print_ntds_csv(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
+fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
     println!("rid,username,is_history,history_index,nt_hash,lm_hash");
     for entry in entries {
         let history_index = entry
@@ -337,7 +337,7 @@ fn print_ntds_csv(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
 }
 
 #[cfg(feature = "ntds.dit")]
-fn print_ntds_hashcat(entries: &[vmkatz::sam::ntds::AdHashEntry]) {
+fn print_ntds_hashcat(entries: &[vmkatz::ntds::AdHashEntry]) {
     let zero_hash = [0u8; 16];
     for entry in entries {
         if entry.nt_hash != zero_hash {
@@ -442,52 +442,54 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Try to open pagefile.sys from the first available disk image
-    #[cfg(feature = "sam")]
-    let pagefile_reader = if !discovery.lsass_files.is_empty() {
-        discovery.disk_files.first().and_then(|d| {
-            match vmkatz::paging::pagefile::PagefileReader::open(d) {
-                Ok(pf) => {
-                    println!(
-                        "[+] Pagefile: {:.1} MB from {}",
-                        pf.pagefile_size() as f64 / (1024.0 * 1024.0),
-                        d.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    Some(pf)
-                }
-                Err(e) => {
-                    log::info!("No pagefile from disk: {}", e);
-                    None
-                }
-            }
-        })
-    } else {
-        None
-    };
-
-    #[cfg(feature = "sam")]
-    let pagefile: PagefileRef<'_> = pagefile_reader.as_ref();
-    #[cfg(not(feature = "sam"))]
-    let pagefile: PagefileRef<'_> = Default::default();
-
-    // Disk path for file-backed DLL resolution
-    #[cfg(feature = "sam")]
-    let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> =
-        discovery.disk_files.first().map(|p| p.as_path());
-    #[cfg(not(feature = "sam"))]
-    let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = Default::default();
-
     #[cfg(any(
         feature = "vmware",
         feature = "vbox",
         feature = "qemu",
         feature = "hyperv"
     ))]
-    for file in &discovery.lsass_files {
-        let name = file.file_name().unwrap_or_default().to_string_lossy();
-        println!("\n[*] LSASS: {}", name);
-        if let Err(e) = run_lsass(file, args, pagefile, disk_path) {
-            eprintln!("[!] {}: {}", name, e);
+    {
+        // Try to open pagefile.sys from the first available disk image
+        #[cfg(feature = "sam")]
+        let pagefile_reader = if !discovery.lsass_files.is_empty() {
+            discovery.disk_files.first().and_then(|d| {
+                match vmkatz::paging::pagefile::PagefileReader::open(d) {
+                    Ok(pf) => {
+                        println!(
+                            "[+] Pagefile: {:.1} MB from {}",
+                            pf.pagefile_size() as f64 / (1024.0 * 1024.0),
+                            d.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        Some(pf)
+                    }
+                    Err(e) => {
+                        log::info!("No pagefile from disk: {}", e);
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        #[cfg(feature = "sam")]
+        let pagefile: PagefileRef<'_> = pagefile_reader.as_ref();
+        #[cfg(not(feature = "sam"))]
+        let pagefile: PagefileRef<'_> = Default::default();
+
+        // Disk path for file-backed DLL resolution
+        #[cfg(feature = "sam")]
+        let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> =
+            discovery.disk_files.first().map(|p| p.as_path());
+        #[cfg(not(feature = "sam"))]
+        let disk_path: vmkatz::lsass::finder::DiskPathRef<'_> = Default::default();
+
+        for file in &discovery.lsass_files {
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            println!("\n[*] LSASS: {}", name);
+            if let Err(e) = run_lsass(file, args, pagefile, disk_path) {
+                eprintln!("[!] {}: {}", name, e);
+            }
         }
     }
 
@@ -514,6 +516,24 @@ fn run_lsass(
     pagefile: PagefileRef<'_>,
     disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
 ) -> anyhow::Result<()> {
+    #[cfg(not(any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )))]
+    {
+        let _ = (input_path, args, pagefile, disk_path);
+        anyhow::bail!("No hypervisor support compiled in (rebuild with --features vmware,vbox,qemu,hyperv)");
+    }
+
+    #[cfg(any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    ))]
+    {
     let verbose = args.verbose || args.list_processes;
     let ext = input_path
         .extension()
@@ -660,9 +680,11 @@ fn run_lsass(
             }
         }
     }
+    } // cfg(any hypervisor)
 }
 
 /// Check if a path is a block device (Linux /dev/...).
+#[cfg(feature = "sam")]
 fn is_block_dev(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -679,6 +701,12 @@ fn is_block_dev(path: &Path) -> bool {
 }
 
 /// Format detection for LSASS memory snapshot files.
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
 enum LsassFormat {
     VBox,
     QemuElf,
@@ -687,6 +715,12 @@ enum LsassFormat {
 }
 
 /// Detect the memory snapshot format from extension and magic bytes.
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
 fn detect_lsass_format(path: &Path, ext: &str) -> LsassFormat {
     // Extension-based detection first
     if ext.eq_ignore_ascii_case("sav") {
@@ -720,6 +754,12 @@ fn detect_lsass_format(path: &Path, ext: &str) -> LsassFormat {
 }
 
 /// Check if file starts with ELF magic bytes (reads only 4 bytes).
+#[cfg(any(
+    feature = "vmware",
+    feature = "vbox",
+    feature = "qemu",
+    feature = "hyperv"
+))]
 fn has_elf_magic(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
