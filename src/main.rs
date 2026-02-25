@@ -58,13 +58,16 @@ use vmkatz::windows::process;
     name = "vmkatz",
     version,
     about = "VM memory forensics - extract credentials from VMware/VirtualBox/QEMU/Hyper-V snapshots and disk images",
-    long_about = "vmkatz extracts Windows credentials from virtual machine memory snapshots and disk images.\n\n\
+    long_about = "vmkatz extracts Windows credentials from virtual machine memory snapshots, disk images, and raw files.\n\n\
         Supported inputs:\n  \
         - VMware snapshots (.vmsn + .vmem)\n  \
         - VirtualBox saved states (.sav)\n  \
         - QEMU/KVM/Proxmox ELF core dumps (.elf, from dump-guest-memory / virsh dump)\n  \
         - Hyper-V legacy saved states (.bin) and raw memory dumps (.raw, .dmp)\n  \
         - Disk images for SAM hashes (.vdi, .vmdk, .qcow2, .vhdx, .vhd)\n  \
+        - Raw registry hives (SAM + SYSTEM [+ SECURITY])\n  \
+        - Raw NTDS.dit + SYSTEM hive\n  \
+        - LSASS minidump (.dmp)\n  \
         - VM directories (auto-discovers all files)\n\n\
         Target: Windows 7 SP1 through Windows 11 x64",
     after_help = "EXAMPLES:\n  \
@@ -72,6 +75,10 @@ use vmkatz::windows::process;
         vmkatz --format ntlm snapshot.vmsn          Output as NTLM hashes\n  \
         vmkatz --disk disk.vmdk snapshot.vmsn       Resolve paged-out creds from disk\n  \
         vmkatz disk.vdi                             Extract SAM hashes + LSA secrets\n  \
+        vmkatz SAM SYSTEM                           Extract from raw registry hives\n  \
+        vmkatz SAM SYSTEM SECURITY                  Full extraction with LSA + cached creds\n  \
+        vmkatz ntds.dit SYSTEM                      Extract AD hashes from raw files\n  \
+        vmkatz lsass.dmp                            Parse LSASS minidump\n  \
         vmkatz /path/to/vm/directory/               Auto-discover and process all files\n  \
         vmkatz --list-processes snapshot.vmsn        List running processes only\n  \
         vmkatz --dump lsass snapshot.vmsn           Dump LSASS as minidump for pypykatz\n  \
@@ -79,9 +86,9 @@ use vmkatz::windows::process;
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
 )]
 struct Args {
-    /// Path to a snapshot, disk image, or VM directory
-    #[arg(value_name = "FILE_OR_DIR")]
-    input_path: String,
+    /// Path(s) to snapshot, disk image, raw hive/NTDS files, or VM directory
+    #[arg(value_name = "FILE", num_args = 1..)]
+    input_paths: Vec<String>,
 
     /// Only list processes (skip credential extraction)
     #[arg(long, default_value_t = false)]
@@ -216,6 +223,40 @@ fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File type detection by magic bytes
+// ---------------------------------------------------------------------------
+
+/// File type detected from magic bytes at the start of the file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RawFileType {
+    EseDatabase,   // NTDS.dit (0xEFCDAB89 at offset 4)
+    RegistryHive,  // SAM/SYSTEM/SECURITY ("regf" at offset 0)
+    Minidump,      // LSASS dump ("MDMP" at offset 0)
+    Other,
+}
+
+fn detect_file_type(path: &Path) -> RawFileType {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return RawFileType::Other;
+    };
+    let mut magic = [0u8; 8];
+    if f.read_exact(&mut magic).is_err() {
+        return RawFileType::Other;
+    }
+    if &magic[0..4] == b"regf" {
+        return RawFileType::RegistryHive;
+    }
+    if magic[4..8] == [0xEF, 0xCD, 0xAB, 0x89] {
+        return RawFileType::EseDatabase;
+    }
+    if &magic[0..4] == b"MDMP" {
+        return RawFileType::Minidump;
+    }
+    RawFileType::Other
+}
+
 fn main() -> anyhow::Result<()> {
     // Show full help (not just error) when no arguments provided
     let args = match Args::try_parse() {
@@ -231,11 +272,71 @@ fn main() -> anyhow::Result<()> {
         .format_timestamp(None)
         .init();
 
-    let input_path = Path::new(&args.input_path);
+    let input_path = Path::new(&args.input_paths[0]);
 
     // Directory mode: auto-discover and process all VM files
-    if input_path.is_dir() {
+    if args.input_paths.len() == 1 && input_path.is_dir() {
         return run_directory(input_path, &args);
+    }
+
+    // Multi-file mode or single raw file: classify by magic bytes
+    let file_types: Vec<(std::path::PathBuf, RawFileType)> = args
+        .input_paths
+        .iter()
+        .map(|p| (std::path::PathBuf::from(p), detect_file_type(Path::new(p))))
+        .collect();
+
+    // Classify files by type for raw file modes
+    #[cfg(feature = "sam")]
+    {
+        let hive_files: Vec<_> = file_types.iter().filter(|(_, t)| *t == RawFileType::RegistryHive).collect();
+
+        // Raw NTDS.dit + SYSTEM hive
+        #[cfg(feature = "ntds.dit")]
+        {
+            let ese_files: Vec<_> = file_types.iter().filter(|(_, t)| *t == RawFileType::EseDatabase).collect();
+            if ese_files.len() == 1 && hive_files.len() >= 1 {
+                return run_raw_ntds(&ese_files[0].0, &hive_files[0].0, &args);
+            }
+        }
+
+        // Raw registry hives (SAM + SYSTEM [+ SECURITY])
+        if hive_files.len() >= 2 {
+            return run_raw_hives(&hive_files, &args);
+        }
+    }
+
+    // Single raw file with helpful error messages
+    if args.input_paths.len() == 1 {
+        match file_types[0].1 {
+            RawFileType::EseDatabase => {
+                anyhow::bail!(
+                    "NTDS.dit detected but no SYSTEM hive provided.\n\
+                     Usage: vmkatz ntds.dit SYSTEM"
+                );
+            }
+            RawFileType::RegistryHive => {
+                anyhow::bail!(
+                    "Registry hive detected but at least SAM + SYSTEM are required.\n\
+                     Usage: vmkatz SAM SYSTEM [SECURITY]"
+                );
+            }
+            RawFileType::Minidump => {
+                return run_minidump(input_path, &args);
+            }
+            RawFileType::Other => {} // fall through to existing logic
+        }
+    }
+
+    // Existing single-file logic: disk images, VM snapshots, block devices
+    if args.input_paths.len() != 1 {
+        anyhow::bail!(
+            "Could not auto-detect file types. Provide either:\n  \
+             vmkatz ntds.dit SYSTEM          (NTDS + SYSTEM hive)\n  \
+             vmkatz SAM SYSTEM [SECURITY]    (raw registry hives)\n  \
+             vmkatz snapshot.vmsn            (VM memory snapshot)\n  \
+             vmkatz disk.vmdk               (virtual disk image)"
+        );
     }
 
     // Auto-detect SAM mode for disk images / block devices, or explicit --sam flag
@@ -361,6 +462,165 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Raw file modes (no disk image / VM snapshot needed)
+// ---------------------------------------------------------------------------
+
+/// Extract AD hashes from raw NTDS.dit + SYSTEM hive files.
+#[cfg(feature = "ntds.dit")]
+fn run_raw_ntds(ntds_path: &Path, system_path: &Path, args: &Args) -> anyhow::Result<()> {
+    let ntds_data =
+        std::fs::read(ntds_path).with_context(|| format!("Failed to read {}", ntds_path.display()))?;
+    let system_data =
+        std::fs::read(system_path).with_context(|| format!("Failed to read {}", system_path.display()))?;
+
+    let ctx = vmkatz::ntds::build_context(&ntds_data, &system_data)
+        .context("NTDS context validation failed")?;
+    let hashes = vmkatz::ntds::extract_ad_hashes(
+        &ntds_data,
+        &system_data,
+        {
+            #[cfg(feature = "ntds.dit")]
+            { args.ntds_history }
+            #[cfg(not(feature = "ntds.dit"))]
+            { false }
+        },
+    )
+    .context("NTDS hash extraction failed")?;
+
+    let c = get_colors(args);
+
+    println!("\n{}[+] NTDS (raw files):{}", c.green, c.reset);
+    println!("  ntds.dit : {} ({} bytes)", ntds_path.display(), ctx.ntds_size);
+    println!("  SYSTEM   : {} ({} bytes)", system_path.display(), system_data.len());
+    println!("  Bootkey  : {}", hex::encode(ctx.boot_key));
+    println!("  Hashes   : {}", hashes.len());
+
+    match args.format.as_str() {
+        "csv" => print_ntds_csv(&hashes),
+        "hashcat" => print_ntds_hashcat(&hashes),
+        "ntlm" => print_ntds_ntlm(&hashes),
+        _ => print_ntds_text(&hashes, c),
+    }
+
+    Ok(())
+}
+
+/// Extract SAM/LSA/DCC2 from raw registry hive files.
+/// Auto-detects which hive is SYSTEM (via bootkey extraction), SAM, and SECURITY.
+#[cfg(feature = "sam")]
+fn run_raw_hives(
+    hive_files: &[&(std::path::PathBuf, RawFileType)],
+    args: &Args,
+) -> anyhow::Result<()> {
+    // Read all hive files
+    let hives: Vec<(&Path, Vec<u8>)> = hive_files
+        .iter()
+        .map(|(p, _)| {
+            let data = std::fs::read(p)
+                .with_context(|| format!("Failed to read {}", p.display()))?;
+            Ok((p.as_path(), data))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // Identify SYSTEM hive by trying bootkey extraction on each
+    let mut system_idx = None;
+    let mut bootkey = [0u8; 16];
+
+    for (i, (path, data)) in hives.iter().enumerate() {
+        if let Ok(key) = vmkatz::sam::bootkey::extract_bootkey(data) {
+            log::info!("SYSTEM hive: {} (bootkey: {})", path.display(), hex::encode(key));
+            system_idx = Some(i);
+            bootkey = key;
+            break;
+        }
+    }
+
+    let system_idx = system_idx.context(
+        "No SYSTEM hive found (could not extract bootkey from any of the provided files)"
+    )?;
+
+    let c = get_colors(args);
+    println!("\n{}[+] Raw hives:{}", c.green, c.reset);
+    println!("  SYSTEM  : {} (bootkey: {})", hives[system_idx].0.display(), hex::encode(bootkey));
+
+    let mut sam_entries = Vec::new();
+    let mut lsa_secrets = Vec::new();
+    let mut cached_creds = Vec::new();
+
+    // Try SAM and SECURITY extraction on the other hives
+    for (i, (path, data)) in hives.iter().enumerate() {
+        if i == system_idx {
+            continue;
+        }
+
+        // Try as SAM
+        if let Ok(entries) = vmkatz::sam::hashes::extract_hashes(data, &bootkey) {
+            if !entries.is_empty() {
+                println!("  SAM     : {} ({} accounts)", path.display(), entries.len());
+                sam_entries = entries;
+                continue;
+            }
+        }
+
+        // Try as SECURITY (LSA secrets + cached creds)
+        if let Ok(secrets) = vmkatz::sam::lsa::extract_lsa_secrets(data, &bootkey) {
+            if !secrets.is_empty() {
+                println!("  SECURITY: {} ({} secrets)", path.display(), secrets.len());
+                let nlkm_key = secrets.iter().find_map(|s| {
+                    if s.name == "NL$KM" {
+                        Some(s.raw_data.clone())
+                    } else {
+                        None
+                    }
+                });
+                lsa_secrets = secrets;
+
+                if let Some(ref nlkm) = nlkm_key {
+                    if let Ok(creds) = vmkatz::sam::cache::extract_cached_credentials(data, nlkm) {
+                        cached_creds = creds;
+                    }
+                }
+            }
+        }
+    }
+
+    if sam_entries.is_empty() && lsa_secrets.is_empty() {
+        anyhow::bail!("Could not extract SAM hashes or LSA secrets from the provided hives");
+    }
+
+    if !sam_entries.is_empty() {
+        match args.format.as_str() {
+            "ntlm" => print_sam_ntlm(&sam_entries),
+            "csv" => print_sam_csv(&sam_entries),
+            "hashcat" => print_sam_hashcat(&sam_entries),
+            _ => print_sam_text(&sam_entries, c),
+        }
+    }
+
+    if !lsa_secrets.is_empty() && args.format != "hashcat" {
+        print_lsa_secrets(&lsa_secrets, c);
+    }
+
+    if !cached_creds.is_empty() {
+        match args.format.as_str() {
+            "hashcat" => print_dcc2_hashcat(&cached_creds),
+            _ => print_cached_credentials(&cached_creds, c),
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle LSASS minidump files.
+fn run_minidump(_input_path: &Path, _args: &Args) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "LSASS minidump parsing is not yet implemented.\n\
+         Workaround: use pypykatz to parse the minidump:\n  \
+         pypykatz minidump lsass.dmp"
+    );
 }
 
 #[cfg(feature = "ntds.dit")]

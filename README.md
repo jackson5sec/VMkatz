@@ -55,6 +55,9 @@ All 9 SSP credential providers that mimikatz implements:
 | QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox |
 | Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V |
 | LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs |
+| Raw registry hives | `SAM`, `SYSTEM`, `SECURITY` | Exported from disk or `reg save` |
+| Raw NTDS.dit | `ntds.dit` + `SYSTEM` | Copied from domain controller |
+| LSASS minidump | `.dmp` | `--dump lsass`, procdump, Task Manager |
 | VM directories | any folder | Auto-discovers all processable files |
 
 **Target OS**: Windows 7 SP1 through Windows Server 2025 x64 (auto-detected).
@@ -73,6 +76,13 @@ cargo build --release
 
 # Extract SAM/LSA/DCC2 from a virtual disk (auto-detected)
 ./vmkatz disk.vmdk
+
+# Extract from raw registry hives (auto-detects SAM/SYSTEM/SECURITY)
+./vmkatz SAM SYSTEM
+./vmkatz SAM SYSTEM SECURITY
+
+# Extract AD hashes from raw NTDS.dit + SYSTEM hive
+./vmkatz ntds.dit SYSTEM
 
 # Extract AD hashes from a domain controller disk (NTDS.dit)
 ./vmkatz --ntds /dev/pve/vm-102-disk-0
@@ -272,8 +282,6 @@ Tested across 7 Windows versions and 4 hypervisors.
 
 ## Acknowledgements
 
-VMkatz builds on the foundational work of several projects that mapped out Windows credential internals:
-
-- [**mimikatz**](https://github.com/gentilkiwi/mimikatz) by Benjamin Delpy ([@gentilkiwi](https://twitter.com/gentilkiwi)) -- the original Windows credential extraction tool. mimikatz's source code is the definitive reference for LSASS internals: SSP structures, crypto key resolution, credential decryption across Windows versions. VMkatz's 9-provider extraction pipeline follows the architecture Benjamin documented.
-- [**pypykatz**](https://github.com/skelsec/pypykatz) by Tamás Jós ([@skelsec](https://twitter.com/skaborern)) -- a pure Python reimplementation of mimikatz credential parsing. pypykatz's clean separation of minidump reading from credential decryption informed VMkatz's design, and its SAM/LSA/DCC2 extraction logic served as a cross-reference for offline registry decryption.
-- [**Impacket**](https://github.com/fortra/impacket) by Fortra (originally by Alberto Solino [@agsolino](https://twitter.com/agsolino)) -- the standard Python library for Windows network protocols. Impacket's `secretsdump.py` is the reference implementation for NTDS.dit extraction, SAM dumping, and the pwdump output format that VMkatz's `--format ntlm` follows.
+- [**mimikatz**](https://github.com/gentilkiwi/mimikatz) by Benjamin Delpy ([@gentilkiwi](https://twitter.com/gentilkiwi)) -- the definitive reference for LSASS internals and Windows credential decryption.
+- [**pypykatz**](https://github.com/skelsec/pypykatz) by Tamás Jós ([@skelsec](https://twitter.com/skelsec)) -- pure Python mimikatz reimplementation, used as cross-reference for SAM/LSA/DCC2 extraction.
+- [**Impacket**](https://github.com/fortra/impacket) by Fortra (originally Alberto Solino) -- reference implementation for NTDS.dit extraction and the pwdump output format.
