@@ -295,7 +295,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "ntds.dit")]
         {
             let ese_files: Vec<_> = file_types.iter().filter(|(_, t)| *t == RawFileType::EseDatabase).collect();
-            if ese_files.len() == 1 && hive_files.len() >= 1 {
+            if ese_files.len() == 1 && !hive_files.is_empty() {
                 return run_raw_ntds(&ese_files[0].0, &hive_files[0].0, &args);
             }
         }
