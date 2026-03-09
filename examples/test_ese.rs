@@ -4,8 +4,15 @@
 use std::env;
 use std::fs;
 
+struct L;
+impl log::Log for L {
+    fn enabled(&self, m: &log::Metadata) -> bool { m.level() <= log::max_level() }
+    fn log(&self, r: &log::Record) { if self.enabled(r.metadata()) { eprintln!("[{}] {}", r.level(), r.args()); } }
+    fn flush(&self) {}
+}
+
 fn main() {
-    env_logger::init();
+    let _ = log::set_logger(&L).map(|()| log::set_max_level(log::LevelFilter::Info));
 
     let path = env::args().nth(1).expect("Usage: test_ese <ntds.dit path>");
     let data = fs::read(&path).expect("Failed to read file");

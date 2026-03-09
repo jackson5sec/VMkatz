@@ -14,6 +14,23 @@ use std::path::Path;
 use anyhow::Context;
 use clap::Parser;
 
+/// Minimal logger (replaces env_logger — saves ~300KB from regex/jiff deps)
+struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{:<5} {}] {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 #[cfg(feature = "hyperv")]
 use vmkatz::hyperv::HypervLayer;
 use vmkatz::lsass;
@@ -330,10 +347,13 @@ fn main() -> anyhow::Result<()> {
         unreachable!()
     }
 
-    let log_level = if args.verbose { "info" } else { "warn" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .format_timestamp(None)
-        .init();
+    let log_level = if args.verbose {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Warn
+    };
+    log::set_logger(&SimpleLogger).unwrap();
+    log::set_max_level(log_level);
 
     let input_path = Path::new(&args.input_paths[0]);
 
