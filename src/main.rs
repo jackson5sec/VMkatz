@@ -94,7 +94,7 @@ use vmkatz::windows::process;
 )]
 struct Args {
     /// Path(s) to snapshot, disk image, raw hive/NTDS files, or VM directory
-    #[arg(value_name = "FILE", num_args = 1..)]
+    #[arg(value_name = "FILE", num_args = 0..)]
     input_paths: Vec<String>,
 
     /// Only list processes (skip credential extraction)
@@ -180,6 +180,16 @@ struct Args {
     #[cfg(feature = "carve")]
     #[arg(long, default_value_t = false)]
     carve: bool,
+
+    /// VMFS-6 raw SCSI device for reading flat VMDKs through VMFS locks
+    #[cfg(feature = "sam")]
+    #[arg(long, value_name = "DEVICE")]
+    vmfs_device: Option<String>,
+
+    /// Flat VMDK path within the VMFS datastore (e.g., "VM-Name/VM-Name-flat.vmdk")
+    #[cfg(feature = "sam")]
+    #[arg(long, value_name = "PATH")]
+    vmdk: Option<String>,
 }
 
 impl Args {
@@ -342,11 +352,6 @@ fn main() -> anyhow::Result<()> {
         }
         Err(e) => e.exit(),
     };
-    if args.input_paths.is_empty() {
-        Args::parse_from(["vmkatz", "--help"]);
-        unreachable!()
-    }
-
     let log_level = if args.verbose {
         log::LevelFilter::Info
     } else {
@@ -354,6 +359,17 @@ fn main() -> anyhow::Result<()> {
     };
     log::set_logger(&SimpleLogger).unwrap();
     log::set_max_level(log_level);
+
+    // VMFS-6 raw device mode: read flat VMDKs directly from SCSI device
+    #[cfg(feature = "sam")]
+    if let Some(ref vmfs_device) = args.vmfs_device {
+        return run_vmfs(Path::new(vmfs_device), args.vmdk.as_deref(), &args);
+    }
+
+    if args.input_paths.is_empty() {
+        Args::parse_from(["vmkatz", "--help"]);
+        unreachable!()
+    }
 
     let input_path = Path::new(&args.input_paths[0]);
 
@@ -473,6 +489,169 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(not(feature = "sam"))]
     run_lsass(input_path, &args, Default::default(), Default::default())
+}
+
+/// Run VMFS-6 raw device mode: read flat VMDKs directly from SCSI device.
+#[cfg(feature = "sam")]
+/// Quick check for MBR partition type 0x07 (NTFS/HPFS) in first sector.
+fn has_ntfs_partitions<R: std::io::Read + std::io::Seek>(reader: &mut R) -> bool {
+    use std::io::SeekFrom;
+    let pos = reader.stream_position().unwrap_or(0);
+    let mut mbr = [0u8; 512];
+    let ok = reader.seek(SeekFrom::Start(0)).is_ok() && reader.read_exact(&mut mbr).is_ok();
+    let _ = reader.seek(SeekFrom::Start(pos));
+    if !ok || mbr[510] != 0x55 || mbr[511] != 0xAA {
+        return false;
+    }
+    // Check 4 MBR partition entries at 0x1BE, each 16 bytes, type byte at offset 4
+    for i in 0..4 {
+        let ptype = mbr[0x1BE + i * 16 + 4];
+        if ptype == 0x07 || ptype == 0xEE {
+            // 0x07 = NTFS, 0xEE = GPT (may contain NTFS)
+            return true;
+        }
+    }
+    false
+}
+
+fn run_vmfs(device_path: &Path, vmdk_path: Option<&str>, args: &Args) -> anyhow::Result<()> {
+    use vmkatz::disk::vmfs;
+    use vmkatz::disk::DiskImage;
+
+    let c = get_colors(args);
+
+    if let Some(vmdk) = vmdk_path {
+        // Single VMDK mode
+        eprintln!(
+            "{}[*] VMFS-6: Opening {} from {}{}",
+            c.cyan,
+            vmdk,
+            device_path.display(),
+            c.reset
+        );
+        let mut disk = vmfs::open_vmfs6_vmdk(device_path, vmdk)
+            .map_err(|e| anyhow::anyhow!("VMFS open failed: {}", e))?;
+
+        eprintln!(
+            "{}[+] VMDK opened: {:.1} GB{}",
+            c.green,
+            disk.disk_size() as f64 / (1024.0 * 1024.0 * 1024.0),
+            c.reset
+        );
+
+        // Extract secrets via the standard pipeline
+        match vmkatz::sam::extract_secrets_from_reader(&mut disk) {
+            Ok(secrets) => {
+                match args.format.as_str() {
+                    "ntlm" => print_sam_ntlm(&secrets.sam_entries),
+                    "csv" => print_sam_csv(&secrets.sam_entries),
+                    "hashcat" => print_sam_hashcat(&secrets.sam_entries),
+                    "brief" => print_sam_brief(&secrets.sam_entries),
+                    _ => print_sam_text(&secrets.sam_entries, c),
+                }
+                if !secrets.lsa_secrets.is_empty() {
+                    match args.format.as_str() {
+                        "csv" => print_lsa_csv(&secrets.lsa_secrets),
+                        "hashcat" => {}
+                        _ => print_lsa_secrets(&secrets.lsa_secrets, c),
+                    }
+                    export_dpapi_backup_keys(&secrets.lsa_secrets);
+                }
+                if !secrets.cached_credentials.is_empty() {
+                    match args.format.as_str() {
+                        "csv" => print_dcc2_csv(&secrets.cached_credentials),
+                        "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+                        _ => print_cached_credentials(&secrets.cached_credentials, c),
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[!] Extraction failed for {}: {}", vmdk, e);
+            }
+        }
+    } else {
+        // Auto-scan mode: list all VMs and extract from each
+        eprintln!(
+            "{}[*] VMFS-6: Scanning all VMs on {}{}",
+            c.cyan,
+            device_path.display(),
+            c.reset
+        );
+
+        let vmdks = vmfs::list_vmfs6_vmdks(device_path)
+            .map_err(|e| anyhow::anyhow!("VMFS scan failed: {}", e))?;
+
+        if vmdks.is_empty() {
+            anyhow::bail!("No flat VMDKs found on VMFS-6 datastore");
+        }
+
+        eprintln!("[+] Found {} flat VMDKs:", vmdks.len());
+        for (vm, vmdk) in &vmdks {
+            eprintln!("    {}/{}", vm, vmdk);
+        }
+
+        for (vm_name, vmdk_name) in &vmdks {
+            let vmdk_path = format!("{}/{}", vm_name, vmdk_name);
+            eprintln!(
+                "\n{}[*] Processing: {}{}",
+                c.cyan, vmdk_path, c.reset
+            );
+
+            match vmfs::open_vmfs6_vmdk(device_path, &vmdk_path) {
+                Ok(mut disk) => {
+                    // Quick check: skip VMDKs with no NTFS partitions (Linux/BSD VMs)
+                    if !has_ntfs_partitions(&mut disk) {
+                        eprintln!("[-] {}: no NTFS partitions, skipping", vm_name);
+                        continue;
+                    }
+                    // Use NTFS-only extraction (no raw fallback scans) for batch mode
+                    match vmkatz::sam::extract_secrets_ntfs_only(&mut disk) {
+                        Ok(secrets) => {
+                            if !secrets.sam_entries.is_empty() {
+                                eprintln!(
+                                    "{}[+] {} — {} SAM hashes:{}",
+                                    c.green,
+                                    vm_name,
+                                    secrets.sam_entries.len(),
+                                    c.reset
+                                );
+                                match args.format.as_str() {
+                                    "ntlm" => print_sam_ntlm(&secrets.sam_entries),
+                                    "csv" => print_sam_csv(&secrets.sam_entries),
+                                    "hashcat" => print_sam_hashcat(&secrets.sam_entries),
+                                    "brief" => print_sam_brief(&secrets.sam_entries),
+                                    _ => print_sam_text(&secrets.sam_entries, c),
+                                }
+                            }
+                            if !secrets.lsa_secrets.is_empty() {
+                                match args.format.as_str() {
+                                    "csv" => print_lsa_csv(&secrets.lsa_secrets),
+                                    "hashcat" => {}
+                                    _ => print_lsa_secrets(&secrets.lsa_secrets, c),
+                                }
+                                export_dpapi_backup_keys(&secrets.lsa_secrets);
+                            }
+                            if !secrets.cached_credentials.is_empty() {
+                                match args.format.as_str() {
+                                    "csv" => print_dcc2_csv(&secrets.cached_credentials),
+                                    "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+                                    _ => print_cached_credentials(&secrets.cached_credentials, c),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[!] {}: {}", vm_name, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to open {}: {}", vmdk_path, e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "sam")]

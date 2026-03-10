@@ -112,8 +112,28 @@ pub fn extract_disk_secrets(path: &Path) -> Result<DiskSecrets> {
     ))
 }
 
+/// Extract SAM hashes via NTFS partitions only (no fallback raw scans).
+/// Faster for batch scanning where most VMDKs are sparse or non-Windows.
+pub fn extract_secrets_ntfs_only<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
+    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+    for &partition_offset in &partitions {
+        log::info!("Trying NTFS partition at offset 0x{:x}", partition_offset);
+        match ntfs_reader::read_hive_files(reader, partition_offset) {
+            Ok((sam_data, system_data, security_data)) => {
+                return process_hive_data(sam_data, system_data, security_data);
+            }
+            Err(e) => {
+                log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+            }
+        }
+    }
+    Err(crate::error::VmkatzError::DecryptionError(
+        "No registry hives found on NTFS partitions".to_string(),
+    ))
+}
+
 /// Extract SAM hashes + LSA secrets from any Read+Seek source.
-fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
+pub fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<DiskSecrets> {
     let partitions = find_ntfs_partitions(reader).unwrap_or_default();
 
     for &partition_offset in &partitions {
