@@ -166,7 +166,10 @@ impl VmwareLayer {
 
     /// Parse a .vmsn file and return (regions, tags).
     fn parse_vmsn_metadata(vmsn_path: &Path) -> Result<(Vec<MemoryRegion>, Vec<Tag>)> {
-        let vmsn_data = fs::read(vmsn_path)?;
+        // Memory-map instead of fs::read to avoid loading the entire multi-GB
+        // snapshot into memory — only the header/tag pages get paged in.
+        let vmsn_file = fs::File::open(vmsn_path)?;
+        let vmsn_data = unsafe { Mmap::map(&vmsn_file)? };
 
         let (hdr, groups) = header::parse_vmsn(&vmsn_data)?;
         log::info!(

@@ -340,15 +340,16 @@ pub fn find_ept_candidates<P: PhysicalMemory>(l1: &P) -> Result<Vec<EptCandidate
     // Scan budget: if no candidates found after scanning a portion of L1, give up.
     // EPT PML4 tables are placed by the hypervisor in the lower portion of L1 memory.
     // For genuine VBS VMs, candidates appear within the first few GB.
-    // Small VMs (<2GB) can't run VBS, so reduce budget to 25%.
+    // Cap at 4GB — scanning more is wasteful since EPTs live in low memory.
+    const MAX_SCAN_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
     let scan_budget = if l1_size < 2 * 1024 * 1024 * 1024 {
         l1_size / 4
     } else {
-        l1_size / 2
+        (l1_size / 4).min(MAX_SCAN_BUDGET)
     };
     let mut pages_since_last_candidate: u64 = 0;
-    // Also give up if we've scanned 2M pages (8GB) without finding a candidate.
-    const PAGES_WITHOUT_CANDIDATE_LIMIT: u64 = 2_000_000;
+    // Give up if we've scanned 256K pages (1GB) without finding a candidate.
+    const PAGES_WITHOUT_CANDIDATE_LIMIT: u64 = 256_000;
 
     let mut addr: u64 = 0;
     while addr < l1_size {
