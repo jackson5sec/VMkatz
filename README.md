@@ -1,8 +1,8 @@
 # VMkatz
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build](https://github.com/nikaiw/VMkatz/actions/workflows/release.yml/badge.svg)](https://github.com/nikaiw/VMkatz/actions/workflows/release.yml)
-[![Clippy](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml/badge.svg)](https://github.com/nikaiw/VMkatz/actions/workflows/clippy.yml)
+[![Build](https://github.com/jackson5sec/VMkatz/actions/workflows/release.yml/badge.svg)](https://github.com/jackson5sec/VMkatz/actions/workflows/release.yml)
+[![Clippy](https://github.com/jackson5sec/VMkatz/actions/workflows/clippy.yml/badge.svg)](https://github.com/jackson5sec/VMkatz/actions/workflows/clippy.yml)
 [![Platform](https://img.shields.io/badge/platform-linux%20|%20windows%20|%20macos%20|%20esxi-lightgrey)]()
 
 ## Too Big to Steal

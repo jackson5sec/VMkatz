@@ -20,15 +20,10 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: esxi-x86_64
+            features: vmware,vmfs,sam,ntds.dit,carve
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: windows-x86_64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: macos-aarch64
 
     runs-on: ${{ matrix.os }}
 
@@ -46,7 +41,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
 
       - name: Archive (Unix)
         if: runner.os != 'Windows'
